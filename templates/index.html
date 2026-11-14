@@ -4,9 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>我的云盘 Pro Max</title>
-    <link href="https://cdn.staticfile.org/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
-    <link href="https://cdn.staticfile.org/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <script src="https://cdn.staticfile.org/vue/3.3.4/vue.global.prod.min.js"></script>
+    <!-- 本地静态资源（Docker 构建时 download_assets.py 已下载到 static/），
+         不再依赖 CDN：内网/断网、CDN 挂了页面也能打开 -->
+    <link href="/static/css/tailwind.css" rel="stylesheet">
+    <link href="/static/css/fontawesome.css" rel="stylesheet">
+    <script src="/static/js/vue.js"></script>
 
     <style>
         /* 全局样式优化 */
@@ -550,8 +552,9 @@
                         const lowerQuery = this.searchQuery.toLowerCase(); 
                         result = result.filter(file => file.name.toLowerCase().includes(lowerQuery)); 
                     }
-                    // 2. 垃圾过滤：【核心】隐藏后端生成的 "批量下载.zip" 临时文件，防止列表污染
-                    result = result.filter(f => !f.name.startsWith('批量下载') && !f.name.match(/^batch_download_.*\.zip$/));
+                    // 2. 垃圾过滤：【核心】隐藏后端生成的打包临时文件，防止列表污染
+                    // tasks.py 生成的是 archive_*.zip，旧的 batch_download_*.zip 兼容保留
+                    result = result.filter(f => !f.name.startsWith('批量下载') && !f.name.match(/^(batch_download_|archive_).*\.zip$/));
                     return result;
                 },
                 activeTransfers() { return this.transferList.filter(t => ['uploading', 'downloading', 'processing', 'error'].includes(t.status)); },
