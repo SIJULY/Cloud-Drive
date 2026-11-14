@@ -197,9 +197,38 @@
         #app .search-input { background: #eef0f7; border: 1px solid transparent; }
         #app .search-input:focus { background: #fff; border-color: #c7d2fe; box-shadow: 0 0 0 3px rgba(79,70,229,.12); }
         ::selection { background: #c7d2fe; }
+        /* 深色模式：body.dark 覆盖主表面（第一版，覆盖侧栏/列表/卡片/弹窗等） */
+        body.dark { background: #0f172a; color: #e2e8f0; }
+        body.dark #app { background: #0f172a; }
+        body.dark .bg-white { background-color: #1e293b !important; }
+        body.dark .bg-gray-50 { background-color: #16213a !important; }
+        body.dark .bg-gray-100 { background-color: #1e293b !important; }
+        body.dark .text-gray-800, body.dark .text-gray-700 { color: #e2e8f0 !important; }
+        body.dark .text-gray-600, body.dark .text-gray-500, body.dark .text-gray-400 { color: #94a3b8 !important; }
+        body.dark .border-gray-100, body.dark .border-gray-200 { border-color: #334155 !important; }
+        body.dark .border-b, body.dark .border-t { border-color: #334155 !important; }
+        body.dark input, body.dark select, body.dark textarea { background-color: #1e293b !important; color: #e2e8f0 !important; border-color: #334155 !important; }
+        body.dark .nav-item:hover { background: #1e293b; }
+        body.dark .nav-item.active { background: #312e81 !important; color: #c7d2fe !important; }
+        body.dark #app .list-row:hover { background: #1e293b !important; }
+        body.dark #app .list-row.selected { background: #312e81 !important; }
+        body.dark #app .grid-card { background: #1e293b !important; border-color: #334155 !important; }
+        body.dark #app .grid-card.selected { background: #312e81 !important; border-color: #6366f1 !important; }
+        body.dark #app .card-preview { background: #0f172a !important; }
+        body.dark .dropdown-menu { background: #1e293b !important; border-color: #334155 !important; }
+        body.dark .dropdown-item { color: #e2e8f0 !important; }
+        body.dark .dropdown-item:hover { background: #334155 !important; }
+        body.dark #app .drawer { background: #1e293b !important; }
+        body.dark #app .search-input { background: #1e293b !important; color: #e2e8f0 !important; }
+        body.dark #app .search-input:focus { background: #0f172a !important; }
+        body.dark .topbar { background: #1e293b !important; border-color: #334155 !important; }
+        body.dark .icon-btn { color: #94a3b8 !important; }
+        body.dark .icon-btn:hover { background: #334155 !important; }
+        body.dark .btn-pill { background: #1e293b !important; color: #e2e8f0 !important; border-color: #334155 !important; }
     </style>
 </head>
 <body class="text-gray-700">
+    <script>try { if (localStorage.getItem('cd-dark') === '1') document.body.classList.add('dark'); } catch (e) {}</script>
 
     <div id="app" class="flex w-full h-full relative" 
          @click="closeMenu" 
@@ -232,6 +261,14 @@
                     <a :href="pdfViewer.url" :download="pdfViewer.name" class="px-3 py-1 rounded text-indigo-600 hover:bg-indigo-50">下载</a>
                 </div>
             </div>
+        </div>
+
+        <div v-if="lightbox.show" class="video-overlay" @click="closeLightbox">
+            <button @click="closeLightbox" class="video-close-btn"><i class="fa-solid fa-xmark"></i></button>
+            <button @click.stop="lightboxPrev" class="absolute left-4 top-1/2 -translate-y-1/2 text-white text-2xl bg-black/40 hover:bg-black/60 rounded-full w-12 h-12 flex items-center justify-center">‹</button>
+            <img :src="'/api/file?path=' + encodeURIComponent(lightboxCurrent.path)" class="max-w-5xl max-h-[85vh] object-contain shadow-2xl" @click.stop alt="">
+            <button @click.stop="lightboxNext" class="absolute right-4 top-1/2 -translate-y-1/2 text-white text-2xl bg-black/40 hover:bg-black/60 rounded-full w-12 h-12 flex items-center justify-center">›</button>
+            <div class="text-white mt-4 text-sm opacity-80">[[ lightboxCurrent.name ]] · [[ lightboxCurrent.date ]]</div>
         </div>
 
         <div v-if="isFetching" class="loading-bar" style="width: 70%; animation: load 2s infinite;"></div>
@@ -306,6 +343,9 @@
                 <div @click="switchCategory('app')" :class="{'active': currentTab === 'category' && currentCategory === 'app'}" class="nav-item flex items-center px-4 py-2.5 rounded-lg text-sm text-gray-600">
                     <i class="fa-brands fa-android w-6 text-center mr-3 text-green-500"></i> 我的应用
                 </div>
+                <div @click="switchTab('timeline')" :class="{'active': currentTab === 'timeline'}" class="nav-item flex items-center px-4 py-2.5 rounded-lg text-sm text-gray-600">
+                    <i class="fa-solid fa-images w-6 text-center mr-3 text-teal-500"></i> 照片时间线
+                </div>
 
                 <div class="my-4 border-t border-gray-100 mx-2"></div>
                 <div @click="switchTab('trash')" :class="{'active': currentTab === 'trash'}" class="nav-item flex items-center px-4 py-3 rounded-lg text-sm text-gray-600">
@@ -316,6 +356,9 @@
                 </div>
                 <div @click="openTotpSettings" class="nav-item flex items-center px-4 py-3 rounded-lg text-sm text-gray-600">
                     <i class="fa-solid fa-shield-halved w-6 text-center mr-3 text-lg opacity-80"></i> 安全设置
+                </div>
+                <div @click="toggleDark" class="nav-item flex items-center px-4 py-3 rounded-lg text-sm text-gray-600">
+                    <i :class="darkMode ? 'fa-solid fa-sun' : 'fa-solid fa-moon'" class="w-6 text-center mr-3 text-lg opacity-80"></i> [[ darkMode ? '浅色模式' : '深色模式' ]]
                 </div>
             </nav>
 
@@ -388,6 +431,7 @@
 
                         <div v-if="currentTab === 'trash'" class="text-lg font-bold text-gray-700 ml-2 flex items-center"><i class="fa-solid fa-trash mr-2 text-gray-400"></i> 回收站</div>
                         <div v-if="currentTab === 'shares'" class="text-lg font-bold text-gray-700 ml-2 flex items-center"><i class="fa-solid fa-share-nodes mr-2 text-gray-400"></i> 我的分享</div>
+                        <div v-if="currentTab === 'timeline'" class="text-lg font-bold text-gray-700 ml-2 flex items-center"><i class="fa-solid fa-images mr-2 text-gray-400"></i> 照片时间线</div>
                         <div v-if="currentTab === 'category'" class="text-lg font-bold text-gray-700 ml-2">
                             <span v-if="currentCategory === 'image'">我的图片</span>
                             <span v-else-if="currentCategory === 'video'">我的视频</span>
@@ -482,7 +526,7 @@
                                             <video muted preload="metadata" playsinline :src="'/api/file?path=' + encodeURIComponent(file.path) + '#t=0.5'" class="w-full h-full object-cover pointer-events-none" @error="$event.target.style.display='none'"></video>
                                             <span class="absolute inset-0 flex items-center justify-center text-white text-[10px]" style="background:rgba(15,23,42,.35)"><i class="fa-solid fa-play"></i></span>
                                         </span>
-                                        <img v-else-if="isImage(file.name)" :src="'/api/file?path=' + encodeURIComponent(file.path)" class="mr-3 w-10 h-10 rounded-lg object-cover bg-slate-100 flex-shrink-0" loading="lazy" alt="" onerror="this.style.display='none'">
+                                        <img v-else-if="isImage(file.name)" :src="'/api/thumb?path=' + encodeURIComponent(file.path)" class="mr-3 w-10 h-10 rounded-lg object-cover bg-slate-100 flex-shrink-0" loading="lazy" alt="" onerror="this.style.display='none'">
                                         <i v-else :class="getFileIcon(file)" class="mr-3 text-xl w-10 text-center"></i>
                                         <span class="truncate max-w-md font-medium text-gray-700 group-hover:text-indigo-600 transition">[[ file.name ]]</span>
                                     </td>
@@ -507,7 +551,7 @@
                             
                             <div class="card-preview mb-2">
                                 <i :class="getFileIcon(file)" class="file-glyph filter drop-shadow-sm transition-transform group-hover:scale-110"></i>
-                                <img v-if="isImage(file.name)" :src="'/api/file?path=' + encodeURIComponent(file.path)" 
+                                <img v-if="isImage(file.name)" :src="'/api/thumb?path=' + encodeURIComponent(file.path)" 
                                      class="pointer-events-none" loading="lazy" alt=""
                                      onerror="this.style.display='none'">
                                 <video v-else-if="isVideo(file.name)" muted preload="metadata" playsinline
@@ -521,6 +565,21 @@
                             <div class="text-xs w-full px-1">
                                 <div class="truncate text-gray-800 font-semibold group-hover:text-indigo-600 transition" :title="file.name">[[ file.name ]]</div>
                                 <div class="text-[11px] text-gray-400 truncate mt-0.5">[[ file.is_dir ? '文件夹' : (file.size + ' · ' + file.mtime) ]]</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </template>
+
+            <template v-else-if="currentTab === 'timeline'">
+                 <div class="px-6 py-2 flex items-center justify-between border-b border-gray-100 h-10 bg-white text-xs"><div class="text-gray-500">按拍摄日期分组 · 共 [[ timelineTotal ]] 张照片</div></div>
+                <div class="flex-1 overflow-auto px-6 pb-6 pt-4">
+                    <div v-if="timelineMonths.length === 0" class="flex flex-col items-center justify-center mt-32 text-gray-400"><i class="fa-solid fa-images text-5xl text-gray-200 mb-4"></i><p>还没有照片</p></div>
+                    <div v-else v-for="month in timelineMonths" :key="month.month" class="mb-8">
+                        <h3 class="font-bold text-gray-700 mb-3">[[ month.month ]] <span class="text-xs text-gray-400 font-normal ml-1">[[ month.count ]] 张</span></h3>
+                        <div class="grid grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-3">
+                            <div v-for="(photo, i) in month.photos" :key="photo.path" class="cursor-pointer rounded-lg overflow-hidden bg-slate-100 aspect-square" @click="openLightbox(month.photos, i)">
+                                <img :src="'/api/thumb?path=' + encodeURIComponent(photo.path)" class="w-full h-full object-cover hover:scale-105 transition" loading="lazy" alt="" :title="photo.name + ' · ' + photo.date">
                             </div>
                         </div>
                     </div>
@@ -715,6 +774,7 @@
                     totpDialog: { show: false, enabled: false, managedByEnv: false, step: 'status', qr: '', secret: '', code: '', error: '' },
                     shareDialog: { show: false, mode: 'create', editId: null, password: '', maxDownloads: '', expiresDays: '', clearPassword: false },
                     dropDialog: { show: false, folder: '', title: '', password: '', maxFiles: '', expiresDays: '' },
+                    timelineMonths: [], lightbox: { show: false, list: [], idx: 0 }, darkMode: false,
                     queue: [], activeCount: 0, maxConcurrency: 3, // 队列相关：同时传/下 3 个文件
                     chunkSize: 5 * 1024 * 1024, // 分片上传：每片 5MB
                     uploadThreads: 4, downloadThreads: 4, // 分片并行线程数
@@ -735,9 +795,12 @@
                     return result;
                 },
                 activeTransfers() { return this.transferList.filter(t => ['uploading', 'downloading', 'processing', 'error'].includes(t.status)); },
-                activeTransferCount() { return this.activeTransfers.filter(t => t.status !== 'error').length; }
+                activeTransferCount() { return this.activeTransfers.filter(t => t.status !== 'error').length; },
+                timelineTotal() { return this.timelineMonths.reduce((n, m) => n + (m.count || 0), 0); },
+                lightboxCurrent() { return (this.lightbox.list[this.lightbox.idx] || {}); }
             },
             mounted() { 
+                this.darkMode = document.body.classList.contains('dark');
                 this.loadFiles(); this.loadHistory(); window.addEventListener('click', this.closeMenu);
                 window.addEventListener('beforeunload', this.handleBeforeUnload);
             },
@@ -778,6 +841,12 @@
                         }
                         else if (this.currentTab === 'category') url = `/api/category?type=${this.currentCategory}&_t=${ts}`;
                         else if (this.currentTab === 'trash') url = `/api/trash/list?_t=${ts}`;
+                        else if (this.currentTab === 'timeline') {
+                            const res = await fetch(`/api/photos/timeline?_t=${ts}`);
+                            const data = await res.json();
+                            this.timelineMonths = data.months || [];
+                            return;
+                        }
                         else if (this.currentTab === 'shares') {
                             const [sRes, dRes] = await Promise.all([fetch(`/api/share/list?_t=${ts}`), fetch(`/api/drop/list?_t=${ts}`)]);
                             const shares = await sRes.json();
@@ -852,6 +921,17 @@
                 pdfZoomIn() { this.pdfViewer.scale = Math.min(this.pdfViewer.scale + 0.2, 3); this.renderPdfPage(); },
                 pdfZoomOut() { this.pdfViewer.scale = Math.max(this.pdfViewer.scale - 0.2, 0.5); this.renderPdfPage(); },
                 closePdf() { this.pdfViewer.show = false; this.pdfViewer.url = ''; this._pdfDoc = null; },
+
+                // --- 深色模式 / 照片灯箱 ---
+                toggleDark() {
+                    this.darkMode = !this.darkMode;
+                    document.body.classList.toggle('dark', this.darkMode);
+                    try { localStorage.setItem('cd-dark', this.darkMode ? '1' : '0'); } catch (e) {}
+                },
+                openLightbox(list, i) { this.lightbox = { show: true, list: list, idx: i }; },
+                closeLightbox() { this.lightbox.show = false; },
+                lightboxPrev() { if (this.lightbox.idx > 0) this.lightbox.idx--; },
+                lightboxNext() { if (this.lightbox.idx < this.lightbox.list.length - 1) this.lightbox.idx++; },
 
                 // --- 两步验证设置 ---
                 async openTotpSettings() {
