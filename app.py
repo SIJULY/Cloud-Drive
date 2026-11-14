@@ -698,7 +698,94 @@ class DropManager(JsonManager):
             return sorted(res, key=lambda x: x['mtime'], reverse=True)
 
 
+FILE_META_FILE = os.path.join(SHARE_DIR, 'file_meta.json')
+
+
+class FileMetaManager(JsonManager):
+    """文件元数据：标签 + 收藏。key 是 storage 内的相对路径。
+    删进回收站时保留（还原后标签还在），彻底删除时才清掉；移动/重命名时 key 跟着走。"""
+
+    def _clean_tags(self, tags):
+        out = []
+        for t in (tags or []):
+            t = str(t).strip().replace('/', '').replace('\\', '')[:20]
+            if t and t not in out:
+                out.append(t)
+            if len(out) >= 10:
+                break
+        return out
+
+    def set_tags(self, rel, tags):
+        with self._lock:
+            self.load_metadata()
+            rec = self.data.get(rel) or {}
+            rec['tags'] = self._clean_tags(tags)
+            if not rec['tags'] and not rec.get('fav'):
+                self.data.pop(rel, None)
+            else:
+                self.data[rel] = rec
+            self.save_metadata()
+            return rec.get('tags', [])
+
+    def toggle_fav(self, rel):
+        with self._lock:
+            self.load_metadata()
+            rec = self.data.get(rel) or {}
+            rec['fav'] = not rec.get('fav')
+            if not rec['fav'] and not rec.get('tags'):
+                self.data.pop(rel, None)
+            else:
+                self.data[rel] = rec
+            self.save_metadata()
+            return bool(rec.get('fav'))
+
+    def _move_keys(self, old, new, copy=False):
+        with self._lock:
+            self.load_metadata()
+            moved = {}
+            for k, v in list(self.data.items()):
+                if k == old or k.startswith(old + '/'):
+                    moved[new + k[len(old):]] = v
+                    if not copy:
+                        del self.data[k]
+            self.data.update(moved)
+            self.save_metadata()
+
+    def move_key(self, old, new):
+        self._move_keys(old, new, copy=False)
+
+    def copy_key(self, old, new):
+        self._move_keys(old, new, copy=True)
+
+    def remove_key(self, rel):
+        with self._lock:
+            self.load_metadata()
+            for k in list(self.data.keys()):
+                if k == rel or k.startswith(rel + '/'):
+                    del self.data[k]
+            self.save_metadata()
+
+    def get_map(self):
+        with self._lock:
+            self.load_metadata()
+            return dict(self.data)
+
+    def prune(self, trash_original_paths):
+        """清掉既不在 storage 也不在回收站里的元数据。"""
+        with self._lock:
+            self.load_metadata()
+            changed = False
+            for k in list(self.data.keys()):
+                if os.path.exists(safe_join(ROOT_DIR, k) or '') or k in trash_original_paths:
+                    continue
+                del self.data[k]
+                changed = True
+            if changed:
+                self.save_metadata()
+
+
 trash_manager = TrashManager(TRASH_META_FILE)
+file_meta_manager = FileMetaManager(FILE_META_FILE)
 share_manager = ShareManager(SHARE_META_FILE)
 drop_manager = DropManager(DROP_META_FILE)
 
@@ -1102,6 +1189,9 @@ def list_files():
     if not os.path.exists(abs_path):
         return jsonify({'files': [], 'usage': get_disk_usage()})
     files = []
+    meta = file_meta_manager.get_map()
+    trash_paths = {v.get('original_path', '') for v in trash_manager.data.values()}
+    file_meta_manager.prune(trash_paths)
     try:
         with os.scandir(abs_path) as entries:
             for entry in entries:
@@ -1109,7 +1199,9 @@ def list_files():
                 if entry.name.startswith(('archive_', 'batch_download_')) and entry.name.endswith('.zip'):
                     continue
                 stat = entry.stat()
-                files.append({'name': entry.name, 'is_dir': entry.is_dir(), 'size': human_readable_size(stat.st_size) if not entry.is_dir() else '-', 'mtime': time.strftime('%Y-%m-%d %H:%M', time.localtime(stat.st_mtime)), 'path': os.path.join(req_path, entry.name).replace('\\', '/')})
+                rel = os.path.join(req_path, entry.name).replace('\\', '/')
+                m = meta.get(rel, {})
+                files.append({'name': entry.name, 'is_dir': entry.is_dir(), 'size': human_readable_size(stat.st_size) if not entry.is_dir() else '-', 'mtime': time.strftime('%Y-%m-%d %H:%M', time.localtime(stat.st_mtime)), 'path': rel, 'tags': m.get('tags', []), 'fav': bool(m.get('fav'))})
     except OSError:
         pass
     return jsonify({'files': sorted(files, key=lambda x: (not x['is_dir'], x['name'])), 'usage': get_disk_usage()})
@@ -1196,6 +1288,7 @@ def list_by_category():
     category_type = request.args.get('type')
     valid_exts = set(CATEGORY_EXTENSIONS.get(category_type, []))
     files = []
+    meta = file_meta_manager.get_map()
     for root, dirs, filenames in os.walk(ROOT_DIR):
         # 跳过打包临时文件所在的根目录 zip 本身在下面按名过滤
         for name in filenames:
@@ -1205,10 +1298,110 @@ def list_by_category():
                 abs_path = os.path.join(root, name)
                 try:
                     stat = os.stat(abs_path)
-                    files.append({'name': name, 'is_dir': False, 'size': human_readable_size(stat.st_size), 'mtime': time.strftime('%Y-%m-%d %H:%M', time.localtime(stat.st_mtime)), 'path': os.path.relpath(abs_path, ROOT_DIR).replace('\\', '/')})
+                    rel = os.path.relpath(abs_path, ROOT_DIR).replace('\\', '/')
+                    m = meta.get(rel, {})
+                    files.append({'name': name, 'is_dir': False, 'size': human_readable_size(stat.st_size), 'mtime': time.strftime('%Y-%m-%d %H:%M', time.localtime(stat.st_mtime)), 'path': rel, 'tags': m.get('tags', []), 'fav': bool(m.get('fav'))})
                 except OSError:
                     pass
     return jsonify({'files': sorted(files, key=lambda x: x['mtime'], reverse=True), 'usage': get_disk_usage()})
+
+
+@app.route('/api/tags/set', methods=['POST'])
+@auth_required
+def set_file_tags():
+    data = get_json()
+    rel = (data.get('path') or '').replace('\\', '/')
+    abs_path = safe_join(ROOT_DIR, rel)
+    if not abs_path or not os.path.exists(abs_path):
+        return jsonify({'error': '文件不存在'}), 404
+    tags = file_meta_manager.set_tags(rel, data.get('tags') or [])
+    return jsonify({'status': 'success', 'tags': tags})
+
+
+@app.route('/api/fav/toggle', methods=['POST'])
+@auth_required
+def toggle_fav():
+    data = get_json()
+    rel = (data.get('path') or '').replace('\\', '/')
+    abs_path = safe_join(ROOT_DIR, rel)
+    if not abs_path or not os.path.exists(abs_path):
+        return jsonify({'error': '文件不存在'}), 404
+    return jsonify({'status': 'success', 'fav': file_meta_manager.toggle_fav(rel)})
+
+
+@app.route('/api/favorites')
+@auth_required
+def list_favorites():
+    meta = file_meta_manager.get_map()
+    files = []
+    for rel, m in meta.items():
+        if not m.get('fav'):
+            continue
+        abs_path = safe_join(ROOT_DIR, rel)
+        if not abs_path or not os.path.isfile(abs_path):
+            continue
+        stat = os.stat(abs_path)
+        files.append({'name': os.path.basename(rel), 'is_dir': False,
+                      'size': human_readable_size(stat.st_size),
+                      'mtime': time.strftime('%Y-%m-%d %H:%M', time.localtime(stat.st_mtime)),
+                      'path': rel, 'tags': m.get('tags', []), 'fav': True})
+    return jsonify({'files': sorted(files, key=lambda x: x['mtime'], reverse=True),
+                    'usage': get_disk_usage()})
+
+
+def _file_sha256(abs_path):
+    h = hashlib.sha256()
+    with open(abs_path, 'rb') as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@app.route('/api/duplicates')
+@auth_required
+def list_duplicates():
+    """重复文件：先按大小分组，只对同大小的文件算 SHA-256（避免全库哈希）。"""
+    by_size = {}
+    for root, _dirs, filenames in os.walk(ROOT_DIR):
+        for name in filenames:
+            if name.startswith(('archive_', 'batch_download_')) and name.endswith('.zip'):
+                continue
+            full = os.path.join(root, name)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            if size == 0:
+                continue
+            by_size.setdefault(size, []).append(full)
+    groups = []
+    for size, paths in by_size.items():
+        if len(paths) < 2:
+            continue
+        by_hash = {}
+        for full in paths:
+            try:
+                by_hash.setdefault(_file_sha256(full), []).append(full)
+            except OSError:
+                continue
+        for digest, same in by_hash.items():
+            if len(same) < 2:
+                continue
+            files = []
+            for full in same:
+                stat = os.stat(full)
+                rel = os.path.relpath(full, ROOT_DIR).replace('\\', '/')
+                files.append({'name': os.path.basename(full), 'path': rel,
+                              'size': human_readable_size(stat.st_size),
+                              'mtime': time.strftime('%Y-%m-%d %H:%M', time.localtime(stat.st_mtime))})
+            files.sort(key=lambda x: x['mtime'], reverse=True)
+            groups.append({'hash': digest, 'size': human_readable_size(size),
+                           'size_bytes': size, 'files': files})
+    groups.sort(key=lambda g: g['size_bytes'], reverse=True)
+    return jsonify({'groups': groups})
 
 @app.route('/api/mkdir', methods=['POST'])
 @auth_required
@@ -1234,6 +1427,8 @@ def rename_item():
         return jsonify({'error': 'Invalid path'}), 400
     try:
         os.rename(src, os.path.join(os.path.dirname(src), name))
+        new_rel = os.path.join(os.path.dirname(data.get('path', '')), name).replace('\\', '/')
+        file_meta_manager.move_key(data.get('path', ''), new_rel)
         return jsonify({'status': 'success'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1265,8 +1460,12 @@ def operate_items():
                 continue
             if action == 'move':
                 shutil.move(src, dst)
+                new_rel = os.path.join(data.get('dest', ''), os.path.basename(rel_path)).replace('\\', '/')
+                file_meta_manager.move_key(rel_path, new_rel)
             elif action == 'copy':
                 shutil.copytree(src, dst) if os.path.isdir(src) else shutil.copy2(src, dst)
+                new_rel = os.path.join(data.get('dest', ''), os.path.basename(rel_path)).replace('\\', '/')
+                file_meta_manager.copy_key(rel_path, new_rel)
             success += 1
         except Exception as e:
             errors.append(str(e))
@@ -1428,8 +1627,11 @@ def permanent_delete():
         p = os.path.join(TRASH_DIR, uid)
         # uid 已校验格式，且 trash 目录内的条目名就是 uid 本身，不拼接用户路径
         try:
+            info = trash_manager.data.get(uid)
             (shutil.rmtree(p) if os.path.isdir(p) else os.remove(p))
             trash_manager.remove_item(uid)
+            if info:
+                file_meta_manager.remove_key(info.get('original_path', ''))
         except OSError:
             pass
     return jsonify({'status': 'success'})
@@ -1440,8 +1642,11 @@ def empty_trash():
     for uid in list(trash_manager.data.keys()):
         p = os.path.join(TRASH_DIR, uid)
         try:
+            info = trash_manager.data.get(uid)
             (shutil.rmtree(p) if os.path.isdir(p) else os.remove(p))
             trash_manager.remove_item(uid)
+            if info:
+                file_meta_manager.remove_key(info.get('original_path', ''))
         except OSError:
             pass
     return jsonify({'status': 'success'})
