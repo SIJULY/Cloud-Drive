@@ -6,6 +6,7 @@ import hmac
 import base64
 import io
 import zipfile
+import tarfile
 import shutil
 import json
 import time
@@ -1177,7 +1178,130 @@ def public_drop_upload(drop_id):
     return jsonify({'status': 'success', 'name': final})
 
 
-# --- 受保护的 API ---
+# --- 压缩包在线解压 ---
+ARCHIVE_EXTS = ('.zip', '.tar', '.tar.gz', '.tgz')
+MAX_EXTRACT_BYTES = 5 * 1024 * 1024 * 1024  # 解压后总大小上限 5GB
+MAX_EXTRACT_FILES = 10000
+
+
+def _archive_kind(abs_path):
+    name = abs_path.lower()
+    if name.endswith(('.tar.gz', '.tgz')):
+        return 'tar'
+    if name.endswith('.tar'):
+        return 'tar'
+    if name.endswith('.zip'):
+        return 'zip'
+    return None
+
+
+def _archive_members(abs_path):
+    """返回 [(name, size, is_dir)]；zip 用 ZipFile，tar 用 tarfile。"""
+    kind = _archive_kind(abs_path)
+    members = []
+    if kind == 'zip':
+        with zipfile.ZipFile(abs_path, 'r') as zf:
+            for info in zf.infolist():
+                members.append((info.filename, info.file_size, info.is_dir()))
+    elif kind == 'tar':
+        with tarfile.open(abs_path, 'r:*') as tf:
+            for m in tf.getmembers():
+                members.append((m.name, m.size, m.isdir()))
+    return members
+
+
+def _unique_dir(parent, name):
+    dest = os.path.join(parent, name)
+    if not os.path.exists(dest):
+        return dest
+    n = 1
+    while True:
+        n += 1
+        cand = os.path.join(parent, f"{name} ({n})")
+        if not os.path.exists(cand):
+            return cand
+
+
+@app.route('/api/archive/list')
+@auth_required
+def archive_list():
+    rel = (request.args.get('path') or '').replace('\\', '/')
+    abs_path = safe_join(ROOT_DIR, rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return jsonify({'error': '文件不存在'}), 404
+    if not _archive_kind(abs_path):
+        return jsonify({'error': '不是支持的压缩包（zip/tar/tar.gz）'}), 400
+    try:
+        members = _archive_members(abs_path)
+    except Exception as e:
+        return jsonify({'error': f'压缩包损坏或无法读取: {e}'}), 400
+    out = [{'name': n, 'size': human_readable_size(s) if not d else '-', 'is_dir': d}
+           for n, s, d in members if n and not n.endswith('/')]
+    return jsonify({'name': os.path.basename(rel), 'count': len(out), 'files': out[:500]})
+
+
+@app.route('/api/extract', methods=['POST'])
+@auth_required
+def extract_archive():
+    data = get_json()
+    rel = (data.get('path') or '').replace('\\', '/')
+    abs_path = safe_join(ROOT_DIR, rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return jsonify({'error': '文件不存在'}), 404
+    kind = _archive_kind(abs_path)
+    if not kind:
+        return jsonify({'error': '不是支持的压缩包（zip/tar/tar.gz）'}), 400
+    try:
+        members = _archive_members(abs_path)
+    except Exception as e:
+        return jsonify({'error': f'压缩包损坏或无法读取: {e}'}), 400
+    files = [(n, s) for n, s, d in members if not d]
+    total = sum(s for _n, s in files)
+    if len(files) > MAX_EXTRACT_FILES:
+        return jsonify({'error': f'文件太多（>{MAX_EXTRACT_FILES}），拒绝解压'}), 400
+    if total > MAX_EXTRACT_BYTES:
+        return jsonify({'error': '解压后超过 5GB，拒绝解压'}), 400
+    if total > shutil.disk_usage(ROOT_DIR).free:
+        return jsonify({'error': '磁盘空间不足'}), 400
+    base = os.path.basename(rel)
+    for suffix in ('.tar.gz', '.tgz', '.zip', '.tar'):
+        if base.lower().endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    dest = _unique_dir(os.path.dirname(abs_path), base or '解压')
+    os.makedirs(dest, exist_ok=True)
+    extracted, skipped = 0, []
+    try:
+        if kind == 'zip':
+            with zipfile.ZipFile(abs_path, 'r') as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    # 加密成员 Python 解不了，跳过并告知
+                    if info.flag_bits & 0x1:
+                        skipped.append(info.filename + '（已加密）')
+                        continue
+                    # Zip-Slip 防护：目标必须落在解压目录内
+                    target = safe_join(dest, info.filename)
+                    if target is None:
+                        skipped.append(info.filename + '（路径非法）')
+                        continue
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with zf.open(info, 'r') as src, open(target, 'wb') as out:
+                        shutil.copyfileobj(src, out, 1024 * 1024)
+                    extracted += 1
+        else:
+            # filter='data'：拒绝绝对路径、.. 穿越、符号链接等
+            with tarfile.open(abs_path, 'r:*') as tf:
+                members = tf.getmembers()
+                tf.extractall(path=dest, filter='data')
+                extracted = len([m for m in members if m.isfile()])
+    except Exception as e:
+        return jsonify({'error': f'解压失败: {e}', 'dest': os.path.relpath(dest, ROOT_DIR).replace('\\', '/'),
+                        'extracted': extracted, 'skipped': skipped}), 500
+    return jsonify({'status': 'success',
+                    'dest': os.path.relpath(dest, ROOT_DIR).replace('\\', '/'),
+                    'extracted': extracted, 'skipped': skipped})
 
 @app.route('/api/list')
 @auth_required
