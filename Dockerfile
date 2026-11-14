@@ -19,6 +19,9 @@ RUN python download_assets.py
 # 复制其余项目代码（放在后面，避免代码变动导致重复下载资源）
 COPY . .
 
+# aria2 回调钩子必须可执行（git 推送不保留执行位，这里显式加上）
+RUN chmod +x /app/aria2-hook.py
+
 # 创建数据挂载点
 VOLUME /app/storage
 VOLUME /app/trash
