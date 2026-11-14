@@ -1,6 +1,8 @@
 import os
 import re
 import secrets
+import hashlib
+import hmac
 import shutil
 import json
 import time
@@ -94,6 +96,16 @@ def safe_name(name):
 
 def get_json():
     return request.json if isinstance(request.json, dict) else {}
+
+
+def _parse_opt_int(v):
+    """可选整数：None/'' → None；非法 → None；否则 int。"""
+    if v in (None, ''):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _upload_dir(upload_id):
@@ -285,8 +297,20 @@ class TrashManager(JsonManager):
         except OSError:
             return '-'
 
+_UNSET = object()  # update_share 里“没传这个字段”的哨兵，区别于显式传 None
+_PW_ITERS = 100_000
+_PW_MAX_FAILS = 5
+_PW_LOCK_SECONDS = 300
+
+
+def _hash_share_password(password, salt_hex):
+    """分享提取码 PBKDF2-HMAC-SHA256 加盐哈希，只存哈希不存明文。"""
+    return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'),
+                               bytes.fromhex(salt_hex), _PW_ITERS).hex()
+
+
 class ShareManager(JsonManager):
-    def create_share(self, rel_path):
+    def create_share(self, rel_path, password=None, max_downloads=None, expires_days=None):
         with self._lock:
             self.load_metadata()
             # 12 位 hex（48 bit），旧的 6 位只有 1677 万种、可爆破
@@ -294,17 +318,97 @@ class ShareManager(JsonManager):
             while share_id in self.data:
                 share_id = uuid.uuid4().hex[:12]
             full_path = safe_join(ROOT_DIR, rel_path)
+            # expires_days：None=用全局默认；0=永不过期；>0=指定天数
+            days = SHARE_EXPIRE_DAYS if expires_days is None else expires_days
             expires_at = None
-            if SHARE_EXPIRE_DAYS > 0:
-                expires_at = (datetime.now() + timedelta(days=SHARE_EXPIRE_DAYS)).isoformat(timespec='seconds')
-            self.data[share_id] = {
+            if days and days > 0:
+                expires_at = (datetime.now() + timedelta(days=days)).isoformat(timespec='seconds')
+            rec = {
                 'file_path': rel_path, 'file_name': os.path.basename(rel_path),
                 'is_dir': os.path.isdir(full_path) if full_path else False,
                 'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'expires_at': expires_at, 'downloads': 0
+                'expires_at': expires_at, 'downloads': 0,
+                'max_downloads': max_downloads if (max_downloads and max_downloads > 0) else None,
+                'pw_salt': None, 'pw_hash': None, 'pw_fails': 0, 'pw_locked_until': None,
             }
+            if password:
+                rec['pw_salt'] = secrets.token_hex(8)
+                rec['pw_hash'] = _hash_share_password(password, rec['pw_salt'])
+            self.data[share_id] = rec
             self.save_metadata()
             return share_id
+
+    def update_share(self, share_id, password=_UNSET, max_downloads=_UNSET, expires_days=_UNSET):
+        """password：_UNSET=不动；''=清除提取码；字符串=设新码。
+        max_downloads：_UNSET=不动；None=不限；>0=上限。
+        expires_days：_UNSET=不动；0=永不过期；>0=从现在起指定天数。"""
+        with self._lock:
+            self.load_metadata()
+            rec = self.data.get(share_id)
+            if not rec:
+                return False
+            if password is not _UNSET:
+                if not password:
+                    rec['pw_salt'] = None
+                    rec['pw_hash'] = None
+                else:
+                    rec['pw_salt'] = secrets.token_hex(8)
+                    rec['pw_hash'] = _hash_share_password(str(password), rec['pw_salt'])
+                rec['pw_fails'] = 0
+                rec['pw_locked_until'] = None
+            if max_downloads is not _UNSET:
+                rec['max_downloads'] = max_downloads if (max_downloads and max_downloads > 0) else None
+            if expires_days is not _UNSET:
+                if expires_days and expires_days > 0:
+                    rec['expires_at'] = (datetime.now() + timedelta(days=expires_days)).isoformat(timespec='seconds')
+                elif expires_days == 0:
+                    rec['expires_at'] = None
+            self.save_metadata()
+            return True
+
+    def verify_password(self, share_id, password):
+        """返回 'ok' / 'wrong' / 'locked' / 'public'（无提取码）。
+        连续错 5 次锁定 5 分钟；计数存在分享记录里，4 个 worker 共享。"""
+        with self._lock:
+            self.load_metadata()
+            rec = self.data.get(share_id)
+            if not rec:
+                return 'wrong'
+            if not rec.get('pw_hash'):
+                return 'public'
+            locked_until = rec.get('pw_locked_until')
+            if locked_until:
+                try:
+                    if datetime.now() < datetime.fromisoformat(locked_until):
+                        return 'locked'
+                except ValueError:
+                    pass
+            ok = hmac.compare_digest(
+                rec['pw_hash'],
+                _hash_share_password(password or '', rec.get('pw_salt') or ''))
+            locked_now = False
+            if ok:
+                rec['pw_fails'] = 0
+                rec['pw_locked_until'] = None
+            else:
+                fails = rec.get('pw_fails', 0) + 1
+                rec['pw_fails'] = fails
+                if fails >= _PW_MAX_FAILS:
+                    rec['pw_fails'] = 0
+                    rec['pw_locked_until'] = (datetime.now() + timedelta(seconds=_PW_LOCK_SECONDS)).isoformat(timespec='seconds')
+                    locked_now = True
+            self.save_metadata()
+            return 'ok' if ok else ('locked' if locked_now else 'wrong')
+
+    @staticmethod
+    def is_exhausted(info):
+        limit = info.get('max_downloads')
+        return bool(limit and limit > 0 and info.get('downloads', 0) >= limit)
+
+    def get_raw(self, share_id):
+        with self._lock:
+            self.load_metadata()
+            return self.data.get(share_id)
 
     def cancel_share(self, share_id):
         with self._lock:
@@ -324,14 +428,17 @@ class ShareManager(JsonManager):
                     continue
                 p = safe_join(ROOT_DIR, info['file_path'])
                 exists = bool(p and os.path.exists(p))
+                status = 'exhausted' if self.is_exhausted(info) else ('normal' if exists else 'lost')
                 res.append({'id': sid, 'name': info['file_name'], 'path': info['file_path'],
                             'mtime': info['created_at'], 'expires_at': info.get('expires_at'),
                             'downloads': info.get('downloads', 0),
-                            'status': 'normal' if exists else 'lost'})
+                            'max_downloads': info.get('max_downloads'),
+                            'has_password': bool(info.get('pw_hash')),
+                            'status': status})
             return sorted(res, key=lambda x: x['mtime'], reverse=True)
 
     def get_file_info(self, share_id):
-        # 过期分享视为不存在，并顺手清理
+        # 过期或已达下载上限的分享视为不存在（记录保留， owner 在列表里能看到状态）
         with self._lock:
             self.load_metadata()
             info = self.data.get(share_id)
@@ -341,12 +448,15 @@ class ShareManager(JsonManager):
                 del self.data[share_id]
                 self.save_metadata()
                 return None
+            if self.is_exhausted(info):
+                return None
             return info
 
     def increment_download(self, share_id):
         with self._lock:
             self.load_metadata()
-            if share_id in self.data and not _is_expired(self.data[share_id]):
+            if share_id in self.data and not _is_expired(self.data[share_id]) \
+                    and not self.is_exhausted(self.data[share_id]):
                 self.data[share_id]['downloads'] = self.data[share_id].get('downloads', 0) + 1
                 self.save_metadata()
 
@@ -420,10 +530,13 @@ def logout():
 def index():
     return render_template('index.html')
 
-@app.route('/s/<share_id>')
+@app.route('/s/<share_id>', methods=['GET', 'POST'])
 def public_share_link(share_id):
     if not re.fullmatch(r'[0-9a-f]{6,12}', share_id or ''):
         return "分享链接已过期或不存在", 404
+    raw = share_manager.get_raw(share_id)
+    if raw and ShareManager.is_exhausted(raw):
+        return "该分享已达下载次数上限", 404
     info = share_manager.get_file_info(share_id)
     if not info:
         return "分享链接已过期或不存在", 404
@@ -432,6 +545,18 @@ def public_share_link(share_id):
         return "源文件已被删除", 404
     if info['is_dir']:
         return f"这是一个文件夹 ({info['file_name']})，暂不支持下载。", 200
+
+    # 提取码门禁：验证通过后在 session 里记一笔，本次浏览器内不再重复输码
+    if info.get('pw_hash') and not session.get('share_auth_' + share_id):
+        err = None
+        if request.method == 'POST':
+            res = share_manager.verify_password(share_id, request.form.get('password', ''))
+            if res in ('ok', 'public'):
+                session['share_auth_' + share_id] = True
+                return redirect(url_for('public_share_link', share_id=share_id))
+            err = '提取码错太多次，已锁定 5 分钟，请稍后再试' if res == 'locked' else '提取码错误'
+        return render_template('share.html', filename=info['file_name'],
+                               need_password=True, pw_error=err)
 
     if request.args.get('dl') == '1':
         share_manager.increment_download(share_id)
@@ -452,7 +577,10 @@ def image_hosting(share_id, ext=None):
     if not re.fullmatch(r'[0-9a-f]{6,12}', share_id or ''):
         return "404 Not Found", 404
     info = share_manager.get_file_info(share_id)
-    if not info:
+    if not info or ShareManager.is_exhausted(info):
+        return "404 Not Found", 404
+    # 带提取码的分享不能走图床直链（嵌在别处会绕过输码）
+    if info.get('pw_hash'):
         return "404 Not Found", 404
     abs_path = safe_join(ROOT_DIR, info['file_path'])
     if not abs_path or not os.path.exists(abs_path):
@@ -572,20 +700,51 @@ def operate_items():
 def create_share_link():
     data = get_json()
     files = data.get('files', [])
-    links = []
+    password = data.get('password')
+    if password is not None:
+        password = str(password)[:64] or None
+    max_dl = _parse_opt_int(data.get('max_downloads'))
+    exp_days = _parse_opt_int(data.get('expires_days'))
+    links, ids = [], []
     media_exts = set(CATEGORY_EXTENSIONS['image'] + CATEGORY_EXTENSIONS['video'])
     for p in files:
         abs_path = safe_join(ROOT_DIR, p)
         if abs_path and os.path.exists(abs_path):
-            share_id = share_manager.create_share(p)
+            share_id = share_manager.create_share(p, password=password,
+                                                  max_downloads=max_dl, expires_days=exp_days)
             filename = os.path.basename(p)
             ext = os.path.splitext(filename)[1].lower()
-            if ext in media_exts:
+            # 带提取码的分享只给 /s/ 链接，不给 /img/ 直链
+            if ext in media_exts and not password:
                 link = f"{request.host_url}img/{share_id}{ext}"
             else:
                 link = f"{request.host_url}s/{share_id}"
             links.append(link)
-    return jsonify({'status': 'success', 'links': links})
+            ids.append(share_id)
+    return jsonify({'status': 'success', 'links': links, 'ids': ids})
+
+
+@app.route('/api/share/update', methods=['POST'])
+@auth_required
+def update_share_link():
+    """改已有分享：password（''=清除提取码）、max_downloads（null=不限）、expires_days（0=永久）。"""
+    data = get_json()
+    sid = data.get('id')
+    if not sid or not re.fullmatch(r'[0-9a-f]{6,12}', str(sid)):
+        return jsonify({'error': 'Invalid id'}), 400
+    pw = _UNSET
+    if 'password' in data:
+        pw = data.get('password')
+        if pw is not None:
+            pw = str(pw)[:64]
+    max_dl = _UNSET
+    if 'max_downloads' in data:
+        max_dl = _parse_opt_int(data.get('max_downloads'))
+    exp = _UNSET
+    if 'expires_days' in data:
+        exp = _parse_opt_int(data.get('expires_days'))
+    ok = share_manager.update_share(sid, password=pw, max_downloads=max_dl, expires_days=exp)
+    return jsonify({'status': 'success' if ok else 'fail'})
 
 @app.route('/api/share/list', methods=['GET'])
 @auth_required
