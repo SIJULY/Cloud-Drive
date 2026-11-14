@@ -7,11 +7,15 @@ import base64
 import io
 import zipfile
 import tarfile
+import mimetypes
 import shutil
 import json
 import time
 import threading
 import uuid
+from email.utils import formatdate
+from urllib.parse import unquote, urlparse, quote
+from xml.etree import ElementTree as ET
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, render_template, jsonify, request, send_file, redirect, session, url_for, after_this_request
@@ -1302,6 +1306,303 @@ def extract_archive():
     return jsonify({'status': 'success',
                     'dest': os.path.relpath(dest, ROOT_DIR).replace('\\', '/'),
                     'extracted': extracted, 'skipped': skipped})
+
+# ================= WebDAV（/dav/）：供 Finder / 资源管理器 / Cyberduck 等挂载 =================
+# Basic 认证（ADMIN_USER/ADMIN_PASS），失败 5 次同 IP 锁 5 分钟（复用登录限流）。
+# 支持 OPTIONS / PROPFIND / GET / HEAD / PUT / MKCOL / DELETE / MOVE / COPY / LOCK / UNLOCK / PROPPATCH。
+# LOCK 只是提示性的（单用户网盘不做强制排他），DELETE 走回收站（网页端可还原）。
+_DAV_LOCKS = {}  # {rel: (token, expiry)}
+_DAV_LOCK_TTL = 600
+
+
+def _dav_auth():
+    """WebDAV Basic 认证：通过返回 True；失败时记一次限流并返回 False。"""
+    ip = request.remote_addr or 'unknown'
+    if _login_locked(ip):
+        return False
+    auth = request.authorization
+    if not auth or auth.type != 'basic':
+        return False
+    ok = hmac.compare_digest(auth.username or '', ADMIN_USER) and \
+        hmac.compare_digest(auth.password or '', ADMIN_PASS)
+    if not ok:
+        _login_failed(ip)
+        return False
+    return True
+
+
+def _dav_unauthorized():
+    resp = app.response_class('Unauthorized', status=401)
+    resp.headers['WWW-Authenticate'] = 'Basic realm="我的云盘"'
+    return resp
+
+
+def _dav_rel(raw):
+    """把 /dav/ 下的 URL 路径解码成 storage 内的相对路径；非法返回 None。"""
+    if raw is None:
+        return ''
+    rel = unquote(raw).replace('\\', '/').strip('/')
+    if rel in ('', '.'):
+        return ''
+    return rel
+
+
+def _dav_href(rel):
+    return '/dav/' + quote(rel) if rel else '/dav/'
+
+
+def _dav_prop_response(rel, abs_path):
+    """一个 <D:response>：文件/文件夹的常用属性。"""
+    st = os.stat(abs_path)
+    is_dir = os.path.isdir(abs_path)
+    resp_el = ET.Element('{DAV:}response')
+    href = ET.SubElement(resp_el, '{DAV:}href')
+    href.text = _dav_href(rel)
+    propstat = ET.SubElement(resp_el, '{DAV:}propstat')
+    prop = ET.SubElement(propstat, '{DAV:}prop')
+    dn = ET.SubElement(prop, '{DAV:}displayname')
+    dn.text = os.path.basename(rel) if rel else '我的云盘'
+    rt = ET.SubElement(prop, '{DAV:}resourcetype')
+    if is_dir:
+        ET.SubElement(rt, '{DAV:}collection')
+    lm = ET.SubElement(prop, '{DAV:}getlastmodified')
+    lm.text = formatdate(st.st_mtime, usegmt=True)
+    etag = ET.SubElement(prop, '{DAV:}getetag')
+    etag.text = '"%x-%x"' % (int(st.st_mtime), st.st_size)
+    if not is_dir:
+        cl = ET.SubElement(prop, '{DAV:}getcontentlength')
+        cl.text = str(st.st_size)
+        ct = ET.SubElement(prop, '{DAV:}getcontenttype')
+        ct.text = mimetypes.guess_type(abs_path)[0] or 'application/octet-stream'
+    status = ET.SubElement(propstat, '{DAV:}status')
+    status.text = 'HTTP/1.1 200 OK'
+    return resp_el
+
+
+def _dav_multistatus(responses):
+    root = ET.Element('{DAV:}multistatus')
+    for r in responses:
+        root.append(r)
+    ET.register_namespace('D', 'DAV:')
+    body = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+    resp = app.response_class(body, status=207, mimetype='application/xml')
+    resp.headers['Content-Type'] = 'application/xml; charset=utf-8'
+    return resp
+
+
+def _dav_dest_rel():
+    """解析 Destination 头，返回 storage 内的相对路径；非法返回 None。"""
+    dest = request.headers.get('Destination')
+    if not dest:
+        return None
+    path = urlparse(dest).path
+    if path.startswith('/dav/'):
+        return _dav_rel(path[5:])
+    if path == '/dav':
+        return ''
+    return None
+
+
+def _dav_check_lock(rel):
+    """路径被锁定时返回 token，否则返回 None（过期锁顺手清掉）。"""
+    now = time.monotonic()
+    expired = [k for k, (_t, exp) in _DAV_LOCKS.items() if exp < now]
+    for k in expired:
+        _DAV_LOCKS.pop(k, None)
+    ent = _DAV_LOCKS.get(rel)
+    return ent[0] if ent else None
+
+
+@app.route('/dav/', defaults={'rel': ''}, methods=['OPTIONS', 'PROPFIND', 'GET', 'HEAD', 'PUT', 'MKCOL', 'DELETE', 'MOVE', 'COPY', 'LOCK', 'UNLOCK', 'PROPPATCH'])
+@app.route('/dav/<path:rel>', methods=['OPTIONS', 'PROPFIND', 'GET', 'HEAD', 'PUT', 'MKCOL', 'DELETE', 'MOVE', 'COPY', 'LOCK', 'UNLOCK', 'PROPPATCH'])
+def webdav(rel):
+    if request.method == 'OPTIONS':
+        resp = app.response_class('', status=200)
+        resp.headers['DAV'] = '1, 2'
+        resp.headers['Allow'] = 'OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY, LOCK, UNLOCK, PROPPATCH'
+        resp.headers['MS-Author-Via'] = 'DAV'
+        return resp
+    if not _dav_auth():
+        return _dav_unauthorized()
+
+    rel = _dav_rel(rel)
+    abs_path = safe_join(ROOT_DIR, rel) if rel else ROOT_DIR
+    if abs_path is None:
+        return '非法路径', 400
+    method = request.method
+
+    if method == 'PROPFIND':
+        if not os.path.exists(abs_path):
+            return '不存在', 404
+        depth = request.headers.get('Depth', 'infinity')
+        responses = [_dav_prop_response(rel, abs_path)]
+        if os.path.isdir(abs_path) and depth != '0':
+            try:
+                with os.scandir(abs_path) as it:
+                    for entry in sorted(it, key=lambda e: e.name):
+                        if entry.name.startswith(('archive_', 'batch_download_')) and entry.name.endswith('.zip'):
+                            continue
+                        child_rel = f"{rel}/{entry.name}" if rel else entry.name
+                        responses.append(_dav_prop_response(child_rel, entry.path))
+            except OSError:
+                pass
+        return _dav_multistatus(responses)
+
+    if method in ('GET', 'HEAD'):
+        if not os.path.exists(abs_path):
+            return '不存在', 404
+        if os.path.isdir(abs_path):
+            return '是文件夹', 405
+        resp = send_file(abs_path, as_attachment=False, conditional=True)
+        resp.headers['Accept-Ranges'] = 'bytes'
+        return resp
+
+    if method == 'PUT':
+        if _dav_check_lock(rel):
+            return '已被锁定', 423
+        parent = os.path.dirname(abs_path)
+        if not os.path.isdir(parent):
+            return '父文件夹不存在', 409
+        existed = os.path.exists(abs_path)
+        # request.stream 直写磁盘，避免大文件先读进内存
+        tmp = abs_path + f'.davtmp.{os.getpid()}'
+        try:
+            with open(tmp, 'wb') as out:
+                shutil.copyfileobj(request.stream, out, 1024 * 1024)
+            os.replace(tmp, abs_path)
+        except OSError as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return f'写入失败: {e}', 500
+        return ('', 204) if existed else ('', 201)
+
+    if method == 'MKCOL':
+        if os.path.exists(abs_path):
+            return '已存在', 405
+        parent = os.path.dirname(abs_path)
+        if not os.path.isdir(parent):
+            return '父文件夹不存在', 409
+        try:
+            os.mkdir(abs_path)
+        except OSError as e:
+            return f'创建失败: {e}', 500
+        return '', 201
+
+    if method == 'DELETE':
+        if not os.path.exists(abs_path):
+            return '不存在', 404
+        if _dav_check_lock(rel):
+            return '已被锁定', 423
+        uid = trash_manager.add_item(os.path.basename(rel), rel, os.path.isdir(abs_path))
+        try:
+            shutil.move(abs_path, os.path.join(TRASH_DIR, uid))
+        except OSError as e:
+            return f'删除失败: {e}', 500
+        # 标签/收藏保留在元数据里，还原后还在（与网页端删除一致；彻底删除时才清）
+        return '', 204
+
+    if method in ('MOVE', 'COPY'):
+        if not os.path.exists(abs_path):
+            return '不存在', 404
+        if _dav_check_lock(rel):
+            return '已被锁定', 423
+        dest_rel = _dav_dest_rel()
+        if dest_rel is None:
+            return '缺少 Destination', 400
+        dest_abs = safe_join(ROOT_DIR, dest_rel) if dest_rel else ROOT_DIR
+        if dest_abs is None:
+            return '目标路径非法', 400
+        if dest_rel == rel:
+            return '', 204
+        overwrite = request.headers.get('Overwrite', 'T').upper() != 'F'
+        if os.path.exists(dest_abs) and not overwrite:
+            return '目标已存在', 412
+        if not os.path.isdir(os.path.dirname(dest_abs)):
+            return '目标父文件夹不存在', 409
+        try:
+            if os.path.exists(dest_abs):
+                if os.path.isdir(dest_abs):
+                    shutil.rmtree(dest_abs)
+                else:
+                    os.remove(dest_abs)
+            if method == 'MOVE':
+                shutil.move(abs_path, dest_abs)
+                file_meta_manager.move_key(rel, dest_rel)
+            else:
+                if os.path.isdir(abs_path):
+                    shutil.copytree(abs_path, dest_abs)
+                else:
+                    shutil.copy2(abs_path, dest_abs)
+                file_meta_manager.copy_key(rel, dest_rel)
+        except OSError as e:
+            return f'操作失败: {e}', 500
+        return '', 201
+
+    if method == 'LOCK':
+        if not os.path.exists(abs_path):
+            return '不存在', 404
+        token = 'opaquelocktoken:' + uuid.uuid4().hex
+        _DAV_LOCKS[rel] = (token, time.monotonic() + _DAV_LOCK_TTL)
+        root = ET.Element('{DAV:}prop')
+        ld = ET.SubElement(root, '{DAV:}lockdiscovery')
+        active = ET.SubElement(ld, '{DAV:}activelock')
+        lt = ET.SubElement(active, '{DAV:}locktype')
+        ET.SubElement(lt, '{DAV:}write')
+        ls = ET.SubElement(active, '{DAV:}lockscope')
+        ET.SubElement(ls, '{DAV:}exclusive')
+        depth = ET.SubElement(active, '{DAV:}depth')
+        depth.text = '0'
+        owner = ET.SubElement(active, '{DAV:}owner')
+        owner.text = '我的云盘'
+        timeout = ET.SubElement(active, '{DAV:}timeout')
+        timeout.text = f'Second-{_DAV_LOCK_TTL}'
+        token_el = ET.SubElement(active, '{DAV:}locktoken')
+        href = ET.SubElement(token_el, '{DAV:}href')
+        href.text = token
+        ET.register_namespace('D', 'DAV:')
+        body = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+        resp = app.response_class(body, status=200, mimetype='application/xml')
+        resp.headers['Content-Type'] = 'application/xml; charset=utf-8'
+        resp.headers['Lock-Token'] = f'<{token}>'
+        return resp
+
+    if method == 'UNLOCK':
+        token_hdr = request.headers.get('Lock-Token', '').strip('<>')
+        ent = _DAV_LOCKS.get(rel)
+        if ent and ent[0] == token_hdr:
+            _DAV_LOCKS.pop(rel, None)
+            return '', 204
+        # 没登记的锁也放行（客户端可能在重启后解锁旧 token）
+        _DAV_LOCKS.pop(rel, None)
+        return '', 204
+
+    if method == 'PROPPATCH':
+        # 不存储自定义属性：全部按已应用返回，客户端不再重试
+        try:
+            tree = ET.fromstring(request.data) if request.data else None
+        except ET.ParseError:
+            tree = None
+        responses = []
+        if tree is not None:
+            for prop_el in tree.iter('{DAV:}prop'):
+                resp_el = ET.Element('{DAV:}response')
+                href = ET.SubElement(resp_el, '{DAV:}href')
+                href.text = _dav_href(rel)
+                propstat = ET.SubElement(resp_el, '{DAV:}propstat')
+                prop = ET.SubElement(propstat, '{DAV:}prop')
+                for child in prop_el:
+                    prop.append(child)
+                status = ET.SubElement(propstat, '{DAV:}status')
+                status.text = 'HTTP/1.1 200 OK'
+                responses.append(resp_el)
+        if not responses:
+            responses = [_dav_prop_response(rel, abs_path)] if os.path.exists(abs_path) else []
+        return _dav_multistatus(responses)
+
+    return '不支持的方法', 405
+
 
 @app.route('/api/list')
 @auth_required
