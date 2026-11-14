@@ -31,7 +31,17 @@
         </div>
 
         <div class="content">
-            {% if filename.lower().endswith(('.mp4', '.webm', '.ogg', '.mov')) %}
+            {% if need_password %}
+                <div class="file-icon"><i class="fa-solid fa-lock text-indigo-500"></i></div>
+                <h2 class="text-xl font-bold text-gray-800 mb-2">{{ filename }}</h2>
+                <p class="text-gray-500 text-sm mb-6">该分享设置了提取码，请输入后查看</p>
+                {% if pw_error %}<p class="text-red-500 text-sm mb-4">{{ pw_error }}</p>{% endif %}
+                <form method="post" class="flex flex-col items-center w-full max-w-xs">
+                    <input type="password" name="password" placeholder="请输入提取码" autofocus
+                           class="w-full px-4 py-3 border border-gray-300 rounded-full mb-4 text-center outline-none focus:border-indigo-500">
+                    <button type="submit" class="btn btn-primary"><i class="fa-solid fa-key mr-2"></i> 验证并查看</button>
+                </form>
+            {% elif filename.lower().endswith(('.mp4', '.webm', '.ogg', '.mov')) %}
                 <div class="video-container">
                     <video controls autoplay name="media">
                         <source src="{{ download_url }}" type="video/mp4">

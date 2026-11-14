@@ -535,13 +535,15 @@
                     <div v-if="files.length === 0" class="flex flex-col items-center justify-center mt-32 text-gray-400"><i class="fa-solid fa-share-nodes text-5xl text-blue-100 mb-4"></i><p>暂无分享记录</p></div>
                     <div v-else class="w-full">
                         <table class="w-full text-left border-collapse">
-                            <thead class="text-xs text-gray-400 border-b border-gray-100"><tr><th class="py-2 pl-4 font-normal">文件名</th><th class="py-2 font-normal w-48">分享链接</th><th class="py-2 font-normal w-32">浏览/下载</th><th class="py-2 font-normal w-40">分享时间</th><th class="py-2 font-normal w-24">操作</th></tr></thead>
+                            <thead class="text-xs text-gray-400 border-b border-gray-100"><tr><th class="py-2 pl-4 font-normal">文件名</th><th class="py-2 font-normal w-48">分享链接</th><th class="py-2 font-normal w-20">提取码</th><th class="py-2 font-normal w-28">浏览/下载</th><th class="py-2 font-normal w-40">分享时间</th><th class="py-2 font-normal w-20">状态</th><th class="py-2 font-normal w-32">操作</th></tr></thead>
                             <tbody class="text-sm text-gray-700">
                                 <tr v-for="file in files" :key="file.id" class="list-row border-b border-gray-50">
                                     <td class="pl-4 py-3 flex items-center"><i :class="getFileIcon(file)" class="mr-3 text-lg"></i><span class="truncate max-w-xs" :class="{'text-red-400 line-through': file.status==='lost'}" :title="file.status==='lost'?'原文件已丢失':''">[[ file.name ]]</span></td>
                                     <td class="py-3"><a :href="'/s/' + file.id" target="_blank" class="text-blue-500 hover:underline text-xs flex items-center"><i class="fa-solid fa-link mr-1"></i> /s/[[ file.id ]]</a></td>
-                                    <td class="py-3 text-gray-400 text-xs">[[ file.downloads ]] 次</td><td class="py-3 text-gray-400 text-xs">[[ file.mtime ]]</td>
-                                    <td class="py-3"><button @click="cancelShare(file.id)" class="text-xs text-red-500 hover:bg-red-50 px-2 py-1 rounded border border-red-200 transition">取消分享</button></td>
+                                    <td class="py-3 text-xs"><span v-if="file.has_password" class="text-amber-600"><i class="fa-solid fa-lock mr-1"></i>有提取码</span><span v-else class="text-gray-400">公开</span></td>
+                                    <td class="py-3 text-gray-400 text-xs">[[ file.downloads ]] / [[ file.max_downloads || '∞' ]] 次</td><td class="py-3 text-gray-400 text-xs">[[ file.mtime ]]</td>
+                                    <td class="py-3 text-xs"><span v-if="file.status==='exhausted'" class="text-red-500">已达上限</span><span v-else-if="file.status==='lost'" class="text-red-500">已丢失</span><span v-else class="text-green-500">正常</span></td>
+                                    <td class="py-3"><button @click="openShareEdit(file)" class="text-xs text-indigo-500 hover:bg-indigo-50 px-2 py-1 rounded border border-indigo-200 transition mr-1">修改</button><button @click="cancelShare(file.id)" class="text-xs text-red-500 hover:bg-red-50 px-2 py-1 rounded border border-red-200 transition">取消分享</button></td>
                                 </tr>
                             </tbody>
                         </table>
@@ -592,6 +594,24 @@
                 </div>
             </div>
         </div>
+        <!-- 分享设置弹窗：新建 / 修改共用 -->
+    <div v-if="shareDialog.show" class="fixed inset-0 z-50 flex items-center justify-center" style="background: rgba(0,0,0,.45)" @click="shareDialog.show = false">
+        <div class="bg-white rounded-2xl shadow-2xl w-11/12 max-w-md p-6" @click.stop>
+            <h3 class="font-bold text-lg text-gray-800 mb-4">[[ shareDialog.mode === 'edit' ? '修改分享' : '创建分享' ]]</h3>
+            <label class="block text-sm text-gray-600 mb-1">提取码（可选）</label>
+            <input v-model="shareDialog.password" type="text" placeholder="留空=公开分享，任何人打开链接都能看" class="w-full border border-gray-200 rounded-lg px-3 py-2 mb-1 text-sm outline-none focus:border-indigo-400">
+            <label v-if="shareDialog.mode === 'edit'" class="flex items-center text-xs text-gray-500 mb-3"><input type="checkbox" v-model="shareDialog.clearPassword" class="mr-1"> 清除提取码（改为公开）</label>
+            <div v-else class="mb-3"></div>
+            <label class="block text-sm text-gray-600 mb-1">下载次数上限（可选）</label>
+            <input v-model="shareDialog.maxDownloads" type="number" min="1" placeholder="留空=不限次数" class="w-full border border-gray-200 rounded-lg px-3 py-2 mb-3 text-sm outline-none focus:border-indigo-400">
+            <label class="block text-sm text-gray-600 mb-1">有效期（天）</label>
+            <input v-model="shareDialog.expiresDays" type="number" min="0" :placeholder="shareDialog.mode === 'edit' ? '留空=不改' : '留空=默认 30 天，0=永久'" class="w-full border border-gray-200 rounded-lg px-3 py-2 mb-4 text-sm outline-none focus:border-indigo-400">
+            <div class="flex justify-end space-x-2">
+                <button @click="shareDialog.show = false" class="px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 rounded-lg">取消</button>
+                <button @click="confirmShare" class="px-4 py-2 text-sm text-white rounded-lg" style="background: linear-gradient(135deg,#4f46e5,#7c3aed)">确定</button>
+            </div>
+        </div>
+    </div>
     </div>
 
     <script>
@@ -607,6 +627,7 @@
                     contextMenu: { show: false, x: 0, y: 0, targetFile: null },
                     isFetching: false, // 用于顶部微型加载条
                     videoPlayer: { show: false, url: '', name: '' },
+                    shareDialog: { show: false, mode: 'create', editId: null, password: '', maxDownloads: '', expiresDays: '', clearPassword: false },
                     queue: [], activeCount: 0, maxConcurrency: 3, // 队列相关：同时传/下 3 个文件
                     chunkSize: 5 * 1024 * 1024, // 分片上传：每片 5MB
                     uploadThreads: 4, downloadThreads: 4, // 分片并行线程数
@@ -713,7 +734,33 @@
                 onDragLeave(e) { if (e.clientX <= 0 || e.clientY <= 0 || e.clientX >= window.innerWidth || e.clientY >= window.innerHeight) { this.dragActive = false; } },
                 onDrop(e) { this.dragActive = false; const files = e.dataTransfer.files; if (files.length > 0 && this.currentTab === 'files') { this.showTransferDrawer = true; this.transferTab = 'active'; Array.from(files).forEach(file => this.uploadOneFile(file)); } },
                 async createFolder() { const name = prompt("请输入文件夹名称:", "新建文件夹"); if (!name) return; const res = await fetch('/api/mkdir', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ path: this.path, name: name }) }); if (res.ok) { this.showToast("文件夹创建成功"); this.loadFiles(this.path); } else { const err = await res.json(); alert("创建失败: " + err.error); } },
-                async shareSelected() { const count = this.selectedFiles.length; if (count === 0) return; const res = await fetch('/api/share/create', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ files: this.selectedFiles }) }); const data = await res.json(); if(data.status === 'success') { const links = data.links.join('\n'); navigator.clipboard.writeText(links).then(() => { alert(`链接已复制:\n${links}`); }); this.showToast(`成功创建 ${count} 个分享`); } else { alert("分享失败"); } this.closeMenu(); },
+                openShareDialog() { this.shareDialog = { show: true, mode: 'create', editId: null, password: '', maxDownloads: '', expiresDays: '', clearPassword: false }; },
+                openShareEdit(file) { this.shareDialog = { show: true, mode: 'edit', editId: file.id, password: '', maxDownloads: file.max_downloads || '', expiresDays: '', clearPassword: false }; },
+                async confirmShare() {
+                    const d = this.shareDialog;
+                    if (d.mode === 'create') {
+                        const count = this.selectedFiles.length; if (count === 0) return;
+                        const body = { files: this.selectedFiles };
+                        if (d.password) body.password = d.password;
+                        if (d.maxDownloads !== '') body.max_downloads = parseInt(d.maxDownloads);
+                        if (d.expiresDays !== '') body.expires_days = parseInt(d.expiresDays);
+                        const res = await fetch('/api/share/create', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+                        const data = await res.json();
+                        if (data.status === 'success') { const links = data.links.join('\n'); navigator.clipboard.writeText(links).then(() => { alert(`链接已复制:\n${links}`); }); this.showToast(`成功创建 ${count} 个分享`); } else { alert("分享失败"); }
+                        this.closeMenu();
+                    } else {
+                        const body = { id: d.editId };
+                        if (d.clearPassword) body.password = '';
+                        else if (d.password) body.password = d.password;
+                        body.max_downloads = d.maxDownloads === '' ? null : parseInt(d.maxDownloads);
+                        if (d.expiresDays !== '') body.expires_days = parseInt(d.expiresDays);
+                        const res = await fetch('/api/share/update', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+                        const data = await res.json();
+                        if (data.status === 'success') { this.showToast("分享已更新"); this.loadFiles(); } else { alert("修改失败"); }
+                    }
+                    d.show = false;
+                },
+                async shareSelected() { if (this.selectedFiles.length === 0) return; this.openShareDialog(); },
                 async cancelShare(shareId) { if(!confirm("确定要取消此分享吗？")) return; await fetch('/api/share/cancel', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ id: shareId }) }); this.showToast("分享已取消"); this.loadFiles(); },
                 async handleMoreAction(action) {
                     this.closeMenu(); const count = this.selectedFiles.length;
