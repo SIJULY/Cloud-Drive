@@ -51,6 +51,12 @@ for d in [ROOT_DIR, TRASH_DIR, SHARE_DIR]:
     if not os.path.exists(d):
         os.makedirs(d)
 
+# --- 分片上传：断点续传临时目录（在 storage 之外，不会出现在文件列表里）---
+UPLOAD_TMP_DIR = os.path.join(BASE_DIR, '.upload_tmp')
+os.makedirs(UPLOAD_TMP_DIR, exist_ok=True)
+CHUNK_TTL_SECONDS = 24 * 3600  # 超过 24 小时没动静的分片视为废弃，下次 init 时清理
+MAX_CHUNKS = 20000  # 50GB / 5MB 分片约 10240 片，留足余量
+
 CATEGORY_EXTENSIONS = {
     'image': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.tiff', '.ico'],
     'video': ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp'],
@@ -88,6 +94,45 @@ def safe_name(name):
 
 def get_json():
     return request.json if isinstance(request.json, dict) else {}
+
+
+def _upload_dir(upload_id):
+    if not re.fullmatch(r'[0-9a-f]{32}', upload_id or ''):
+        return None
+    return os.path.join(UPLOAD_TMP_DIR, upload_id)
+
+
+def _upload_meta(upload_id):
+    d = _upload_dir(upload_id)
+    if not d:
+        return None
+    p = os.path.join(d, 'meta.json')
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _uploaded_chunks(upload_id, total):
+    d = _upload_dir(upload_id)
+    if not d:
+        return []
+    return [i for i in range(total)
+            if os.path.isfile(os.path.join(d, f'{i}.part'))]
+
+
+def _cleanup_stale_uploads():
+    now = time.time()
+    try:
+        for name in os.listdir(UPLOAD_TMP_DIR):
+            p = os.path.join(UPLOAD_TMP_DIR, name)
+            if os.path.isdir(p) and now - os.path.getmtime(p) > CHUNK_TTL_SECONDS:
+                shutil.rmtree(p, ignore_errors=True)
+    except OSError:
+        pass
 
 
 def _is_expired(info):
@@ -390,7 +435,9 @@ def public_share_link(share_id):
 
     if request.args.get('dl') == '1':
         share_manager.increment_download(share_id)
-        response = send_file(abs_path, as_attachment=False, download_name=info['file_name'])
+        # conditional=True：支持 Range 分段请求（视频拖进度、多线程下载的前提）
+        response = send_file(abs_path, as_attachment=False, download_name=info['file_name'],
+                             conditional=True)
         response.headers["Accept-Ranges"] = "bytes"
         return response
 
@@ -410,7 +457,7 @@ def image_hosting(share_id, ext=None):
     abs_path = safe_join(ROOT_DIR, info['file_path'])
     if not abs_path or not os.path.exists(abs_path):
         return "404 Not Found", 404
-    response = send_file(abs_path, as_attachment=False)
+    response = send_file(abs_path, as_attachment=False, conditional=True)
     response.headers["Accept-Ranges"] = "bytes"
     return response
 
@@ -647,6 +694,131 @@ def upload_file():
     file.save(os.path.join(save_dir, filename))
     return jsonify({'status': 'success'})
 
+
+# ================= 分片上传 + 断点续传 =================
+# 流程：init（拿 upload_id + 已传分片）-> chunk（并行传分片，可重试/续传）
+#      -> complete（服务端按序合并校验）-> status/cancel 辅助接口。
+# 分片 5MB 一片（前端定），单文件 50GB 上限不变；旧的单次 /api/upload 保留兼容。
+
+@app.route('/api/upload/init', methods=['POST'])
+@auth_required
+def upload_init():
+    data = get_json()
+    filename = safe_name(data.get('name', ''))
+    size = data.get('size')
+    chunk_size = data.get('chunk_size')
+    total_chunks = data.get('total_chunks')
+    if (not filename or not isinstance(size, int) or size <= 0
+            or size > app.config['MAX_CONTENT_LENGTH']
+            or not isinstance(chunk_size, int) or not 1024 * 1024 <= chunk_size <= 64 * 1024 * 1024
+            or not isinstance(total_chunks, int) or not 1 <= total_chunks <= MAX_CHUNKS
+            or total_chunks != (size + chunk_size - 1) // chunk_size):
+        return jsonify({'error': 'Invalid upload params'}), 400
+    rel_path = data.get('path', '') or ''
+    save_dir = safe_join(ROOT_DIR, rel_path) if rel_path else ROOT_DIR
+    if save_dir is None:
+        return jsonify({'error': 'Invalid path'}), 400
+    _cleanup_stale_uploads()
+    # 断点续传：前端带回上次的 upload_id 且元数据一致时复用，已传分片不用重传
+    upload_id = data.get('upload_id') or ''
+    meta = _upload_meta(upload_id) if upload_id else None
+    if not (meta and meta.get('name') == filename and meta.get('size') == size
+            and meta.get('chunk_size') == chunk_size
+            and meta.get('total_chunks') == total_chunks
+            and meta.get('path') == rel_path):
+        upload_id = uuid.uuid4().hex
+        meta = {'name': filename, 'path': rel_path, 'size': size,
+                'chunk_size': chunk_size, 'total_chunks': total_chunks,
+                'created': time.time()}
+        os.makedirs(_upload_dir(upload_id), exist_ok=True)
+        with open(os.path.join(_upload_dir(upload_id), 'meta.json'), 'w', encoding='utf-8') as f:
+            json.dump(meta, f)
+    return jsonify({'upload_id': upload_id,
+                    'uploaded': _uploaded_chunks(upload_id, total_chunks)})
+
+
+@app.route('/api/upload/chunk', methods=['POST'])
+@auth_required
+def upload_chunk():
+    upload_id = request.form.get('upload_id', '')
+    meta = _upload_meta(upload_id)
+    if not meta:
+        return jsonify({'error': 'Invalid upload_id'}), 400
+    try:
+        index = int(request.form.get('index', -1))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid index'}), 400
+    if not 0 <= index < meta['total_chunks'] or 'chunk' not in request.files:
+        return jsonify({'error': 'Invalid chunk'}), 400
+    chunk = request.files['chunk']
+    data = chunk.read()
+    expected = meta['chunk_size'] if index < meta['total_chunks'] - 1 \
+        else meta['size'] - meta['chunk_size'] * (meta['total_chunks'] - 1)
+    if len(data) != expected:
+        return jsonify({'error': 'Chunk size mismatch'}), 400
+    d = _upload_dir(upload_id)
+    tmp = os.path.join(d, f'{index}.tmp')
+    with open(tmp, 'wb') as f:
+        f.write(data)
+    os.replace(tmp, os.path.join(d, f'{index}.part'))
+    return jsonify({'status': 'success', 'index': index})
+
+
+@app.route('/api/upload/status')
+@auth_required
+def upload_status():
+    upload_id = request.args.get('upload_id', '')
+    meta = _upload_meta(upload_id)
+    if not meta:
+        return jsonify({'error': 'Invalid upload_id'}), 400
+    return jsonify({'upload_id': upload_id,
+                    'uploaded': _uploaded_chunks(upload_id, meta['total_chunks']),
+                    'total_chunks': meta['total_chunks']})
+
+
+@app.route('/api/upload/complete', methods=['POST'])
+@auth_required
+def upload_complete():
+    upload_id = get_json().get('upload_id', '')
+    meta = _upload_meta(upload_id)
+    if not meta:
+        return jsonify({'error': 'Invalid upload_id'}), 400
+    uploaded = _uploaded_chunks(upload_id, meta['total_chunks'])
+    if len(uploaded) != meta['total_chunks']:
+        return jsonify({'error': 'Missing chunks',
+                        'missing': sorted(set(range(meta['total_chunks'])) - set(uploaded))}), 400
+    rel_path = meta['path']
+    save_dir = safe_join(ROOT_DIR, rel_path) if rel_path else ROOT_DIR
+    if save_dir is None:
+        return jsonify({'error': 'Invalid path'}), 400
+    os.makedirs(save_dir, exist_ok=True)
+    final_path = os.path.join(save_dir, meta['name'])
+    d = _upload_dir(upload_id)
+    try:
+        with open(final_path, 'wb') as out:
+            for i in range(meta['total_chunks']):
+                with open(os.path.join(d, f'{i}.part'), 'rb') as part:
+                    shutil.copyfileobj(part, out, length=1024 * 1024)
+            out.flush()
+            os.fsync(out.fileno())
+        if os.path.getsize(final_path) != meta['size']:
+            os.remove(final_path)
+            return jsonify({'error': 'Size mismatch after merge'}), 400
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return jsonify({'status': 'success'})
+
+
+@app.route('/api/upload/cancel', methods=['POST'])
+@auth_required
+def upload_cancel():
+    upload_id = get_json().get('upload_id', '')
+    d = _upload_dir(upload_id)
+    if d:
+        shutil.rmtree(d, ignore_errors=True)
+    return jsonify({'status': 'success'})
+
+
 @app.route('/api/archive', methods=['POST'])
 @auth_required
 def archive_files():
@@ -692,7 +864,7 @@ def download_result_file():
             or not (name.startswith('archive_') or name.startswith('batch_download_'))
             or not os.path.isfile(resolved)):
         return jsonify({'error': 'Invalid file'}), 400
-    return send_file(resolved, as_attachment=True, download_name=name)
+    return send_file(resolved, as_attachment=True, download_name=name, conditional=True)
 
 @app.route('/api/file')
 @auth_required
@@ -700,7 +872,11 @@ def get_file_content():
     abs_path = safe_join(ROOT_DIR, request.args.get('path', ''))
     if not abs_path or not os.path.isfile(abs_path):
         return jsonify({'error': 'File not found'}), 404
-    return send_file(abs_path)
+    # conditional=True：Werkzeug 处理 Range 请求回 206 + Content-Range，
+    # 视频在线拖进度、浏览器断点续传、多线程分段下载都靠它。
+    response = send_file(abs_path, conditional=True)
+    response.headers["Accept-Ranges"] = "bytes"
+    return response
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
