@@ -9,6 +9,8 @@
     <link href="/static/css/tailwind.css" rel="stylesheet">
     <link href="/static/css/fontawesome.css" rel="stylesheet">
     <script src="/static/js/vue.js"></script>
+    <script src="/static/vendor/hls.min.js"></script>
+    <script src="/static/vendor/marked.min.js"></script>
 
     <style>
         /* 全局样式优化 */
@@ -240,10 +242,12 @@
 
         <div v-if="videoPlayer.show" class="video-overlay">
             <button @click="closeVideo" class="video-close-btn"><i class="fa-solid fa-xmark"></i></button>
-            <video controls autoplay class="w-full h-full max-w-5xl max-h-[90vh] outline-none shadow-2xl" :src="videoPlayer.url">
+            <video ref="videoEl" controls autoplay class="w-full h-full max-w-5xl max-h-[90vh] outline-none shadow-2xl" :src="videoPlayer.url">
                 您的浏览器不支持视频播放。
             </video>
-            <div class="text-white mt-4 text-sm font-mono opacity-80">正在播放: [[ videoPlayer.name ]]</div>
+            <div class="text-white mt-4 text-sm font-mono opacity-80">正在播放: [[ videoPlayer.name ]] <span v-if="videoPlayer.hls" class="text-emerald-300">· 720p 流畅</span></div>
+            <div v-if="videoPlayer.status" class="text-amber-300 mt-1 text-xs">[[ videoPlayer.status ]]</div>
+            <button v-if="videoPlayer.hls && videoPlayer.url === ''" @click="playDirect" class="mt-2 text-xs text-gray-300 underline">改看原画</button>
         </div>
 
         <div v-if="pdfViewer.show" class="video-overlay">
@@ -299,6 +303,8 @@
             <div class="h-px bg-gray-100 my-1" v-if="isPdf(contextMenu.targetFile?.name)"></div>
             <div v-if="isArchive(contextMenu.targetFile?.name)" class="dropdown-item" @click="openArchive(contextMenu.targetFile)"><i class="fa-solid fa-file-zipper text-amber-500"></i> 查看压缩包</div>
             <div class="h-px bg-gray-100 my-1" v-if="isArchive(contextMenu.targetFile?.name)"></div>
+            <div v-if="isText(contextMenu.targetFile?.name)" class="dropdown-item" @click="openEditor(contextMenu.targetFile)"><i class="fa-solid fa-pen-to-square text-emerald-500"></i> 编辑</div>
+            <div v-if="!contextMenu.targetFile?.is_dir" class="dropdown-item" @click="openVersions(contextMenu.targetFile)"><i class="fa-solid fa-clock-rotate-left text-indigo-500"></i> 历史版本</div>
             
             <div class="dropdown-item" @click="downloadSelected"><i class="fa-solid fa-download"></i> 下载</div>
             <div class="dropdown-item" @click="shareSelected"><i class="fa-solid fa-share-nodes"></i> 分享</div>
@@ -369,6 +375,12 @@
                 <div @click="switchTab('shares')" :class="{'active': currentTab === 'shares'}" class="nav-item flex items-center px-4 py-3 rounded-lg text-sm text-gray-600">
                     <i class="fa-solid fa-share-nodes w-6 text-center mr-3 text-lg opacity-80"></i> 我的分享
                 </div>
+                <div @click="openOfflineDialog" class="nav-item flex items-center px-4 py-3 rounded-lg text-sm text-gray-600">
+                    <i class="fa-solid fa-cloud-arrow-down w-6 text-center mr-3 text-lg opacity-80"></i> 离线下载
+                </div>
+                <div @click="switchTab('audit')" :class="{'active': currentTab === 'audit'}" class="nav-item flex items-center px-4 py-3 rounded-lg text-sm text-gray-600">
+                    <i class="fa-solid fa-clock-rotate-left w-6 text-center mr-3 text-lg opacity-80"></i> 操作记录
+                </div>
                 <div @click="openTotpSettings" class="nav-item flex items-center px-4 py-3 rounded-lg text-sm text-gray-600">
                     <i class="fa-solid fa-shield-halved w-6 text-center mr-3 text-lg opacity-80"></i> 安全设置
                 </div>
@@ -388,6 +400,10 @@
                 <div class="text-xs text-gray-400 flex justify-between">
                     <span>已用 [[ usage.used ]]</span>
                     <span>总共 [[ usage.total ]]</span>
+                </div>
+                <div v-if="usage.quota" class="text-xs text-amber-600 flex justify-between mt-1">
+                    <span>配额已用 [[ usage.quota_used ]]</span>
+                    <span>配额 [[ usage.quota ]]</span>
                 </div>
                 <div class="mt-3 pt-3 border-t border-gray-100 flex items-center justify-between">
                     <span class="text-xs text-gray-400">WebDAV: <span class="font-mono">/dav/</span></span>
@@ -409,7 +425,7 @@
                     </div>
 
                     <div class="flex items-center space-x-3 ml-2">
-                        <template v-if="currentTab === 'files'">
+                        <template v-if="currentTab === 'files' && !inMount">
                             <button @click="triggerUpload" class="btn-pill btn-primary">
                                 <i class="fa-solid fa-cloud-arrow-up"></i> 上传
                             </button>
@@ -421,6 +437,7 @@
                             </button>
                             <input type="file" ref="fileInput" @change="handleFileUpload" style="display: none" multiple>
                         </template>
+                        <div v-if="currentTab === 'files' && inMount" class="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-full px-3 py-1.5"><i class="fa-solid fa-lock mr-1"></i> 只读挂载 · 只能看不能改</div>
 
                         <template v-if="selectedFiles.length > 0 && (currentTab === 'files' || currentTab === 'category' || currentTab === 'favorites')">
                             <div class="h-6 w-px bg-gray-300 mx-2"></div>
@@ -453,6 +470,8 @@
                         <div v-if="currentTab === 'timeline'" class="text-lg font-bold text-gray-700 ml-2 flex items-center"><i class="fa-solid fa-images mr-2 text-gray-400"></i> 照片时间线</div>
                         <div v-if="currentTab === 'favorites'" class="text-lg font-bold text-gray-700 ml-2 flex items-center"><i class="fa-solid fa-star mr-2 text-gray-400"></i> 我的收藏</div>
                         <div v-if="currentTab === 'duplicates'" class="text-lg font-bold text-gray-700 ml-2 flex items-center"><i class="fa-solid fa-copy mr-2 text-gray-400"></i> 重复文件</div>
+                        <div v-if="currentTab === 'audit'" class="text-lg font-bold text-gray-700 ml-2 flex items-center"><i class="fa-solid fa-clock-rotate-left mr-2 text-gray-400"></i> 操作记录</div>
+                        <div v-if="currentTab === 'search'" class="text-lg font-bold text-gray-700 ml-2 flex items-center"><i class="fa-solid fa-magnifying-glass mr-2 text-gray-400"></i> 全文搜索：[[ searchQuery ]]</div>
                         <div v-if="currentTab === 'category'" class="text-lg font-bold text-gray-700 ml-2">
                             <span v-if="currentCategory === 'image'">我的图片</span>
                             <span v-else-if="currentCategory === 'video'">我的视频</span>
@@ -465,7 +484,7 @@
                 <div class="flex items-center space-x-4">
                     <div class="relative group">
                         <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-gray-400 text-xs group-focus-within:text-blue-500 transition-colors"></i>
-                        <input type="text" v-model="searchQuery" ref="searchInput" placeholder="搜索文件..." 
+                        <input type="text" v-model="searchQuery" ref="searchInput" placeholder="搜索文件…（回车全文搜索）" @keyup.enter="doFullSearch"
                                class="search-input pl-9 pr-8 py-2 rounded-full text-sm focus:ring-2 focus:ring-blue-100 outline-none w-48 transition-all focus:w-64 placeholder-gray-400 border border-transparent">
                         <button v-if="searchQuery" @click="searchQuery = ''" class="absolute right-2.5 top-2.5 text-gray-400 hover:text-gray-600">
                             <i class="fa-solid fa-circle-xmark text-sm"></i>
@@ -485,7 +504,7 @@
                 </div>
             </div>
 
-            <template v-if="currentTab === 'files' || currentTab === 'category' || currentTab === 'favorites'">
+            <template v-if="currentTab === 'files' || currentTab === 'category' || currentTab === 'favorites' || currentTab === 'search'">
                 <div class="px-6 py-2 flex items-center justify-between border-b border-gray-100 h-10 bg-white text-xs select-none">
                     <div class="flex items-center text-gray-500">
                         <template v-if="selectedFiles.length > 0">
@@ -525,7 +544,7 @@
                     <div v-else-if="filteredFiles.length === 0" class="flex flex-col items-center justify-center mt-32 text-gray-300">
                         <div class="bg-gray-50 p-6 rounded-full mb-4"><i class="fa-solid fa-folder-open text-5xl text-gray-200"></i></div>
                         <p class="text-sm text-gray-400">这里空空如也</p>
-                        <button v-if="currentTab === 'files'" @click="triggerUpload" class="mt-4 px-4 py-2 text-sm bg-blue-50 text-blue-600 rounded hover:bg-blue-100 transition">上传文件</button>
+                        <button v-if="currentTab === 'files' && !inMount" @click="triggerUpload" class="mt-4 px-4 py-2 text-sm bg-blue-50 text-blue-600 rounded hover:bg-blue-100 transition">上传文件</button>
                     </div>
 
                     <div v-else-if="viewMode === 'list'" class="w-full">
@@ -557,6 +576,8 @@
                                         <img v-else-if="isImage(file.name)" :src="'/api/thumb?path=' + encodeURIComponent(file.path)" class="mr-3 w-10 h-10 rounded-lg object-cover bg-slate-100 flex-shrink-0" loading="lazy" alt="" onerror="this.style.display='none'">
                                         <i v-else :class="getFileIcon(file)" class="mr-3 text-xl w-10 text-center"></i>
                                         <span class="truncate max-w-md font-medium text-gray-700 group-hover:text-indigo-600 transition">[[ file.name ]]</span>
+                                        <span v-if="file.is_mount" class="ml-1 text-[10px] bg-amber-50 text-amber-600 px-1.5 py-0.5 rounded-full whitespace-nowrap">只读</span>
+                                        <span v-if="file.snippet" class="ml-2 text-xs text-gray-400 truncate max-w-xs" v-html="file.snippet"></span>
                                         <span v-for="tag in (file.tags || [])" :key="tag" class="ml-1 text-[10px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded-full whitespace-nowrap">[[ tag ]]</span>
                                         <button @click.stop="toggleFav(file)" class="ml-2 text-sm flex-shrink-0" :class="file.fav ? 'text-amber-500' : 'text-gray-300 hover:text-amber-400'" :title="file.fav ? '取消收藏' : '收藏'"><i :class="file.fav ? 'fa-solid fa-star' : 'fa-regular fa-star'"></i></button>
                                     </td>
@@ -601,11 +622,30 @@
                             </div>
                             <div class="text-xs w-full px-1">
                                 <div class="truncate text-gray-800 font-semibold group-hover:text-indigo-600 transition" :title="file.name">[[ file.name ]]</div>
-                                <div class="text-[11px] text-gray-400 truncate mt-0.5">[[ file.is_dir ? '文件夹' : (file.size + ' · ' + file.mtime) ]]</div>
+                                <div class="text-[11px] text-gray-400 truncate mt-0.5">[[ file.is_dir ? (file.is_mount ? '只读挂载文件夹' : '文件夹') : (file.size + ' · ' + file.mtime) ]]</div>
+                                <div v-if="currentTab === 'search'" class="text-[11px] text-gray-400 truncate mt-0.5">[[ file.path ]]</div>
                                 <div v-if="(file.tags || []).length" class="mt-1 flex flex-wrap gap-1"><span v-for="tag in file.tags" :key="tag" class="text-[10px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded-full">[[ tag ]]</span></div>
                             </div>
                         </div>
                     </div>
+                </div>
+            </template>
+
+            <template v-else-if="currentTab === 'audit'">
+                <div class="px-6 py-2 flex items-center justify-between border-b border-gray-100 h-10 bg-white text-xs"><div class="text-gray-500">最近的操作（登录、上传、删除、分享、解压、编辑等）</div><button @click="loadFiles('')" class="text-indigo-500 hover:text-indigo-700">刷新</button></div>
+                <div class="flex-1 overflow-auto px-6 pb-6 pt-4">
+                    <div v-if="auditItems.length === 0" class="flex flex-col items-center justify-center mt-32 text-gray-400"><i class="fa-solid fa-clock-rotate-left text-5xl text-gray-200 mb-4"></i><p>暂无操作记录</p></div>
+                    <table v-else class="w-full text-left border-collapse">
+                        <thead class="text-xs text-gray-400 border-b border-gray-100 sticky top-0 bg-white z-10"><tr><th class="py-2 font-normal w-40">时间</th><th class="py-2 font-normal w-28">操作</th><th class="py-2 font-normal">对象</th><th class="py-2 font-normal">详情</th></tr></thead>
+                        <tbody class="text-sm text-gray-700">
+                            <tr v-for="(a, i) in auditItems" :key="i" class="border-b border-gray-50">
+                                <td class="py-2.5 text-gray-400 text-xs font-mono">[[ a.ts ]]</td>
+                                <td class="py-2.5">[[ a.action ]]</td>
+                                <td class="py-2.5 truncate max-w-xs" :title="a.path">[[ a.path ]]</td>
+                                <td class="py-2.5 text-gray-400 text-xs truncate max-w-xs" :title="a.detail">[[ a.detail ]]</td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </div>
             </template>
 
@@ -794,6 +834,73 @@
         </div>
     </div>
 
+    <!-- 文本编辑弹窗 -->
+    <div v-if="editorDialog.show" class="fixed inset-0 z-50 flex items-center justify-center" style="background: rgba(0,0,0,.45)">
+        <div class="bg-white rounded-2xl shadow-2xl w-11/12 max-w-3xl p-6 max-h-[85vh] flex flex-col">
+            <h3 class="font-bold text-lg text-gray-800 mb-1 truncate">[[ editorDialog.name ]]</h3>
+            <p class="text-xs text-gray-400 mb-3">保存时旧版自动存入历史版本 · [[ editorDialog.readonly ? '只读挂载，不可保存' : '支持 Markdown 预览' ]]</p>
+            <div v-if="editorDialog.loading" class="text-sm text-gray-400 text-center py-8">加载中…</div>
+            <template v-else>
+                <div class="flex space-x-2 mb-2">
+                    <button @click="editorDialog.preview = false" class="px-3 py-1 text-xs rounded-full" :class="editorDialog.preview ? 'text-gray-500 hover:bg-gray-100' : 'bg-indigo-50 text-indigo-600'">编辑</button>
+                    <button @click="editorDialog.preview = true" class="px-3 py-1 text-xs rounded-full" :class="editorDialog.preview ? 'bg-indigo-50 text-indigo-600' : 'text-gray-500 hover:bg-gray-100'">预览</button>
+                </div>
+                <textarea v-if="!editorDialog.preview" v-model="editorDialog.content" :readonly="editorDialog.readonly" class="flex-1 w-full border border-gray-200 rounded-lg p-3 font-mono text-sm outline-none focus:border-indigo-300 min-h-[300px] resize-y" placeholder="写点什么…"></textarea>
+                <div v-else class="flex-1 overflow-auto border border-gray-200 rounded-lg p-4 text-sm text-gray-700 prose max-w-none" v-html="editorPreviewHtml()"></div>
+            </template>
+            <div class="flex justify-end space-x-2 mt-4">
+                <button @click="editorDialog.show = false" class="px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 rounded-lg">关闭</button>
+                <button v-if="!editorDialog.readonly" @click="saveEditor" class="px-4 py-2 text-sm text-white rounded-lg" style="background: linear-gradient(135deg,#6366f1,#8b5cf6)">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 历史版本弹窗 -->
+    <div v-if="versionsDialog.show" class="fixed inset-0 z-50 flex items-center justify-center" style="background: rgba(0,0,0,.45)" @click="versionsDialog.show = false">
+        <div class="bg-white rounded-2xl shadow-2xl w-11/12 max-w-md p-6 max-h-[80vh] flex flex-col" @click.stop>
+            <h3 class="font-bold text-lg text-gray-800 mb-1 truncate">[[ versionsDialog.name ]]</h3>
+            <p class="text-xs text-gray-400 mb-4">最近 10 个版本 · 还原前当前版也会先存一份</p>
+            <div v-if="versionsDialog.loading" class="text-sm text-gray-400 text-center py-8">加载中…</div>
+            <div v-else class="flex-1 overflow-auto">
+                <div v-for="v in versionsDialog.versions" :key="v.id" class="flex items-center px-3 py-2 border-b border-gray-50 text-sm">
+                    <i class="fa-solid fa-clock-rotate-left text-indigo-400 mr-3"></i>
+                    <span class="flex-1 text-gray-700">[[ v.mtime ]]</span>
+                    <span class="text-xs text-gray-400 mr-3">[[ v.size ]]</span>
+                    <button @click="restoreVersion(v)" class="text-xs text-indigo-600 hover:text-indigo-800 mr-2">还原</button>
+                    <button @click="deleteVersion(v)" class="text-xs text-red-400 hover:text-red-600">删除</button>
+                </div>
+                <div v-if="!versionsDialog.versions.length" class="text-sm text-gray-400 text-center py-8">还没有历史版本（覆盖写文件后自动产生）</div>
+            </div>
+            <div class="flex justify-end mt-4"><button @click="versionsDialog.show = false" class="px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 rounded-lg">关闭</button></div>
+        </div>
+    </div>
+
+    <!-- 离线下载弹窗 -->
+    <div v-if="offlineDialog.show" class="fixed inset-0 z-50 flex items-center justify-center" style="background: rgba(0,0,0,.45)">
+        <div class="bg-white rounded-2xl shadow-2xl w-11/12 max-w-lg p-6 max-h-[80vh] flex flex-col">
+            <h3 class="font-bold text-lg text-gray-800 mb-1">离线下载</h3>
+            <p class="text-xs text-gray-400 mb-4">服务器帮你下载 http(s) 链接和磁力链接，下好后放进目标文件夹<span v-if="!offlineDialog.aria2" class="text-red-500"> · aria2 未运行</span></p>
+            <div class="flex space-x-2 mb-2">
+                <input v-model="offlineDialog.url" type="text" placeholder="粘贴 http(s) 链接或磁力链接…" class="flex-1 border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-indigo-300">
+                <button @click="addOffline" class="px-4 py-2 text-sm text-white rounded-lg" style="background: linear-gradient(135deg,#6366f1,#8b5cf6)">下载</button>
+            </div>
+            <p class="text-xs text-gray-400 mb-3">目标文件夹：[[ offlineDialog.dest || '根目录' ]]</p>
+            <div class="flex-1 overflow-auto">
+                <div v-for="t in offlineDialog.tasks" :key="t.gid" class="border-b border-gray-50 py-2 text-sm">
+                    <div class="flex items-center">
+                        <span class="flex-1 truncate text-gray-700" :title="t.url">[[ t.url ]]</span>
+                        <span class="text-xs ml-2" :class="t.status === 'done' ? 'text-emerald-600' : t.status === 'error' ? 'text-red-500' : 'text-indigo-600'">[[ t.status === 'done' ? '已完成' : t.status === 'error' ? '失败' : (t.progress || 0) + '%' ]]</span>
+                        <button v-if="t.status !== 'done'" @click="cancelOffline(t)" class="text-xs text-gray-400 hover:text-red-500 ml-2">取消</button>
+                    </div>
+                    <div v-if="t.status === 'error'" class="text-xs text-red-400 mt-1 truncate">[[ t.error ]]</div>
+                    <div v-if="t.status !== 'done' && t.status !== 'error'" class="w-full bg-gray-100 rounded-full h-1.5 mt-1.5 overflow-hidden"><div class="bg-indigo-500 h-1.5 rounded-full" :style="{width: (t.progress || 0) + '%'}"></div></div>
+                </div>
+                <div v-if="!offlineDialog.tasks.length" class="text-sm text-gray-400 text-center py-6">还没有离线任务</div>
+            </div>
+            <div class="flex justify-end mt-4"><button @click="closeOfflineDialog" class="px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 rounded-lg">关闭</button></div>
+        </div>
+    </div>
+
     <!-- 标签设置弹窗 -->
     <div v-if="tagDialog.show" class="fixed inset-0 z-50 flex items-center justify-center" style="background: rgba(0,0,0,.45)" @click="tagDialog.show = false">
         <div class="bg-white rounded-2xl shadow-2xl w-11/12 max-w-md p-6" @click.stop>
@@ -890,6 +997,11 @@
                     archiveDialog: { show: false, path: '', name: '', entries: [], loading: false },
                     shortcutsDialog: { show: false },
                     clipboard: { action: '', files: [] },
+                    mountName: '',
+                    editorDialog: { show: false, path: '', name: '', content: '', original: '', preview: false, readonly: false, loading: false },
+                    versionsDialog: { show: false, path: '', name: '', versions: [], loading: false },
+                    offlineDialog: { show: false, url: '', dest: '', tasks: [], aria2: false, loading: false, timer: null },
+                    auditItems: [],
                     queue: [], activeCount: 0, maxConcurrency: 3, // 队列相关：同时传/下 3 个文件
                     chunkSize: 5 * 1024 * 1024, // 分片上传：每片 5MB
                     uploadThreads: 4, downloadThreads: 4, // 分片并行线程数
@@ -897,10 +1009,11 @@
             },
             computed: {
                 currentFolderName() { if (!this.path) return ''; const parts = this.path.split('/'); return parts[parts.length - 1]; },
+                inMount() { return this.mountName && (this.path === this.mountName || this.path.startsWith(this.mountName + '/')); },
                 filteredFiles() { 
-                    // 1. 基础过滤：搜索
+                    // 1. 基础过滤：搜索（全文搜索页的结果已是服务端筛过的，不再二次过滤）
                     let result = this.files;
-                    if (this.searchQuery) {
+                    if (this.searchQuery && this.currentTab !== 'search') {
                         const lowerQuery = this.searchQuery.toLowerCase(); 
                         result = result.filter(file => file.name.toLowerCase().includes(lowerQuery) || (file.tags || []).some(t => t.toLowerCase().includes(lowerQuery))); 
                     }
@@ -952,6 +1065,7 @@
                     
                     try {
                         let url = '';
+                        if (this.currentTab === 'search') { this.doFullSearch(); return; }
                         if (this.currentTab === 'files') { 
                             this.path = newPath; 
                             url = `/api/list?path=${encodeURIComponent(newPath)}&_t=${ts}`; 
@@ -979,10 +1093,15 @@
                                 .sort((a, b) => (b.mtime || '').localeCompare(a.mtime || ''));
                             return;
                         }
+                        else if (this.currentTab === 'audit') {
+                            const res = await fetch(`/api/audit?limit=100&_t=${ts}`);
+                            this.auditItems = await res.json();
+                            return;
+                        }
                         
                         const res = await fetch(url); const data = await res.json();
                         // 数据返回后，瞬间替换，用户无感知
-                        if(Array.isArray(data)) this.files = data; else { this.files = data.files; this.usage = data.usage; }
+                        if(Array.isArray(data)) this.files = data; else { this.files = data.files; this.usage = data.usage; if (data.mount_name) this.mountName = data.mount_name; }
                     } catch (e) { console.error(e); } finally { 
                         this.loading = false; 
                         this.isFetching = false; 
@@ -998,18 +1117,60 @@
                     else if (this.isVideo(file.name)) { this.playVideo(file); } 
                     else if (this.isPdf(file.name)) { this.openPdf(file); }
                     else if (this.isArchive(file.name)) { this.openArchive(file); }
+                    else if (this.isText(file.name)) { this.openEditor(file); }
                     else { this.selectedFiles = [file.path]; this.downloadSelected(); } 
                 },
                 
-                // --- 视频播放 ---
-                isVideo(name) { return name && /\.(mp4|webm|ogg|mov)$/i.test(name); },
-                playVideo(file) {
-                    this.videoPlayer.url = '/api/file?path=' + encodeURIComponent(file.path);
-                    this.videoPlayer.name = file.name;
-                    this.videoPlayer.show = true;
+                // --- 视频播放（mp4 优先走 720p HLS，失败回落原画直播） ---
+                isVideo(name) { return name && /\.(mp4|webm|ogg|mov|mkv)$/i.test(name); },
+                async playVideo(file) {
+                    this.videoPlayer = { show: true, url: '', name: file.name, path: file.path, hls: false, status: '' };
                     this.closeMenu();
+                    const direct = '/api/file?path=' + encodeURIComponent(file.path);
+                    // 只有 mp4/mov/mkv 才转 HLS；webm/ogg 浏览器原生播
+                    if (!/\.(mp4|mov|mkv)$/i.test(file.name)) { this.videoPlayer.url = direct; return; }
+                    try {
+                        const res = await fetch('/api/hls/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ path: file.path }) });
+                        const data = await res.json();
+                        if (!res.ok) { this.videoPlayer.url = direct; return; }
+                        this.videoPlayer.hls = true;
+                        this.videoPlayer.status = data.status === 'ready' ? '' : '正在转 720p，稍等片刻…';
+                        await this.attachHls(data.hid, direct);
+                    } catch (e) { this.videoPlayer.url = direct; }
+                },
+                async attachHls(hid, direct) {
+                    await this.$nextTick();
+                    const playlist = `/api/hls/${hid}/playlist.m3u8`;
+                    for (let i = 0; i < 40; i++) {
+                        const head = await fetch(playlist, { method: 'GET' });
+                        if (head.ok) break;
+                        if (head.status !== 202) { this.videoPlayer.url = direct; return; }
+                        await new Promise(r => setTimeout(r, 3000));
+                        if (!this.videoPlayer.show) return;
+                    }
+                    if (!this.videoPlayer.show) return;
+                    const video = this.$refs.videoEl;
+                    if (window.Hls && window.Hls.isSupported()) {
+                        if (this._hls) this._hls.destroy();
+                        const hls = new window.Hls();
+                        hls.loadSource(playlist);
+                        hls.attachMedia(video);
+                        this._hls = hls;
+                        this.videoPlayer.status = '';
+                    } else if (video && video.canPlayType('application/vnd.apple.mpegurl')) {
+                        video.src = playlist;
+                        this.videoPlayer.status = '';
+                    } else {
+                        this.videoPlayer.url = direct;
+                    }
+                },
+                playDirect() {
+                    if (this._hls) { this._hls.destroy(); this._hls = null; }
+                    this.videoPlayer.url = '/api/file?path=' + encodeURIComponent(this.videoPlayer.path);
+                    this.videoPlayer.status = '';
                 },
                 closeVideo() {
+                    if (this._hls) { this._hls.destroy(); this._hls = null; }
                     this.videoPlayer.show = false;
                     this.videoPlayer.url = ''; 
                 },
@@ -1122,6 +1283,97 @@
                     if (e.key === 'Enter') { if (this.selectedFiles.length === 1) { const f = this.files.find(x => x.path === this.selectedFiles[0]); if (f) this.handleFileDblClick(f); } return; }
                     if (e.key === '/') { e.preventDefault(); this.$refs.searchInput && this.$refs.searchInput.focus(); return; }
                     if (e.key === '?') { this.shortcutsDialog.show = true; return; }
+                },
+
+                // --- 文本编辑 / 历史版本 / 全文搜索 / 离线下载 ---
+                isText(name) { return name && /\.(txt|md|json|yaml|yml|log|csv|html|css|js|py|sh|xml|ini|conf)$/i.test(name); },
+                async openEditor(file) {
+                    this.editorDialog = { show: true, path: file.path, name: file.name, content: '', original: '', preview: false, readonly: false, loading: true };
+                    this.closeMenu();
+                    try {
+                        const res = await fetch('/api/text?path=' + encodeURIComponent(file.path));
+                        const data = await res.json();
+                        if (res.ok) { this.editorDialog.content = data.content; this.editorDialog.original = data.content; this.editorDialog.readonly = data.readonly; }
+                        else { alert('打开失败: ' + (data.error || res.status)); this.editorDialog.show = false; }
+                    } catch (e) { alert('网络错误'); this.editorDialog.show = false; }
+                    this.editorDialog.loading = false;
+                },
+                async saveEditor() {
+                    const res = await fetch('/api/text', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ path: this.editorDialog.path, content: this.editorDialog.content }) });
+                    const data = await res.json();
+                    if (res.ok) { this.editorDialog.original = this.editorDialog.content; this.showToast('已保存（旧版已存入历史版本）'); }
+                    else { alert('保存失败: ' + (data.error || res.status)); }
+                },
+                editorPreviewHtml() {
+                    if (!window.marked) return '';
+                    return window.marked.parse(this.editorDialog.content || '');
+                },
+                async openVersions(file) {
+                    this.versionsDialog = { show: true, path: file.path, name: file.name, versions: [], loading: true };
+                    this.closeMenu();
+                    try {
+                        const res = await fetch('/api/versions?path=' + encodeURIComponent(file.path));
+                        const data = await res.json();
+                        if (res.ok) { this.versionsDialog.versions = data.versions || []; }
+                        else { alert('读取失败: ' + (data.error || res.status)); this.versionsDialog.show = false; }
+                    } catch (e) { alert('网络错误'); this.versionsDialog.show = false; }
+                    this.versionsDialog.loading = false;
+                },
+                async restoreVersion(v) {
+                    if (!confirm(`还原到 ${v.mtime} 的版本？当前内容会先存为一个新版本。`)) return;
+                    const res = await fetch('/api/versions/restore', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ path: this.versionsDialog.path, version_id: v.id }) });
+                    const data = await res.json();
+                    if (res.ok) { this.showToast('已还原'); this.versionsDialog.show = false; this.loadFiles(this.path); }
+                    else { alert('还原失败: ' + (data.error || res.status)); }
+                },
+                async deleteVersion(v) {
+                    if (!confirm(`删除 ${v.mtime} 的版本？`)) return;
+                    const res = await fetch('/api/versions/delete', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ path: this.versionsDialog.path, version_id: v.id }) });
+                    if (res.ok) { this.versionsDialog.versions = this.versionsDialog.versions.filter(x => x.id !== v.id); }
+                    else { alert('删除失败'); }
+                },
+                async doFullSearch() {
+                    const q = (this.searchQuery || '').trim();
+                    if (!q) { this.loadFiles(''); return; }
+                    this.currentTab = 'search';
+                    this.files = [];
+                    this.loading = true;
+                    try {
+                        const res = await fetch('/api/search?q=' + encodeURIComponent(q));
+                        const data = await res.json();
+                        this.files = data.results || [];
+                    } catch (e) { console.error(e); }
+                    this.loading = false;
+                },
+                openOfflineDialog() {
+                    this.offlineDialog.show = true;
+                    this.offlineDialog.dest = this.currentTab === 'files' ? this.path : '';
+                    this.refreshOffline();
+                    this.offlineDialog.timer = setInterval(() => { if (this.offlineDialog.show) this.refreshOffline(); }, 3000);
+                },
+                closeOfflineDialog() {
+                    this.offlineDialog.show = false;
+                    if (this.offlineDialog.timer) { clearInterval(this.offlineDialog.timer); this.offlineDialog.timer = null; }
+                },
+                async refreshOffline() {
+                    try {
+                        const res = await fetch('/api/offline/list');
+                        const data = await res.json();
+                        this.offlineDialog.tasks = data.tasks || [];
+                        this.offlineDialog.aria2 = data.aria2;
+                    } catch (e) { console.error(e); }
+                },
+                async addOffline() {
+                    const url = (this.offlineDialog.url || '').trim();
+                    if (!url) { alert('先填下载链接'); return; }
+                    const res = await fetch('/api/offline/add', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ url, path: this.offlineDialog.dest }) });
+                    const data = await res.json();
+                    if (res.ok) { this.offlineDialog.url = ''; this.showToast('已加入离线下载'); this.refreshOffline(); }
+                    else { alert('添加失败: ' + (data.error || res.status)); }
+                },
+                async cancelOffline(task) {
+                    const res = await fetch('/api/offline/cancel', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ gid: task.gid }) });
+                    if (res.ok) { this.refreshOffline(); }
                 },
 
                 // --- 拖拽移动 / 标签 / 收藏 / 重复文件 ---

@@ -80,6 +80,26 @@ assets = [
         "name": "pdf.worker.mjs",
         "min_size": 100000,
     },
+    # hls.js：720p HLS 流畅播放用（Safari 自带 HLS，其他浏览器靠它）。
+    {
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js",
+            "https://unpkg.com/hls.js@1.5.13/dist/hls.min.js",
+        ],
+        "folder": "static/vendor",
+        "name": "hls.min.js",
+        "min_size": 50000,
+    },
+    # marked：Markdown 在线编辑的预览渲染（单用户自写内容，不额外做消毒）。
+    {
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js",
+            "https://unpkg.com/marked@12.0.0/marked.min.js",
+        ],
+        "folder": "static/vendor",
+        "name": "marked.min.js",
+        "min_size": 10000,
+    },
 ]
 
 base_dir = os.path.dirname(os.path.abspath(__file__))

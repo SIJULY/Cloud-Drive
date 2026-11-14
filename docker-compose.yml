@@ -12,6 +12,10 @@ services:
       - ADMIN_PASS=${ADMIN_PASS:?请在 .env 里设置 ADMIN_PASS}
       - SECRET_KEY=${SECRET_KEY:?请在 .env 里设置 SECRET_KEY}
       - SHARE_EXPIRE_DAYS=${SHARE_EXPIRE_DAYS:-30}
+      - QUOTA_GB=${QUOTA_GB:-0}
+      - READONLY_MOUNT_PATH=${READONLY_MOUNT_PATH:-}
+      - READONLY_MOUNT_NAME=${READONLY_MOUNT_NAME:-外部只读}
+      - ARIA2_SECRET=${ARIA2_SECRET:-}
       - REDIS_URL=redis://redis:6379/0
       - STORAGE_PATH=/app/storage
       - TRASH_PATH=/app/trash

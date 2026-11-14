@@ -2,9 +2,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# 安装系统依赖 (curl 用于健康检查)
+# 安装系统依赖 (curl 用于健康检查；aria2 供离线下载，ffmpeg 供 720p HLS 转码)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
+    curl aria2 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制依赖清单并安装 Python 包

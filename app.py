@@ -13,6 +13,11 @@ import json
 import time
 import threading
 import uuid
+import sqlite3
+import subprocess
+import urllib.request
+import urllib.error
+import fcntl
 from email.utils import formatdate
 from urllib.parse import unquote, urlparse, quote
 from xml.etree import ElementTree as ET
@@ -804,9 +809,338 @@ def human_readable_size(size):
 def get_disk_usage():
     try:
         total, used, free = shutil.disk_usage(ROOT_DIR)
-        return {'used': human_readable_size(used), 'total': human_readable_size(total), 'percent': (used / total) * 100}
+        out = {'used': human_readable_size(used), 'total': human_readable_size(total), 'percent': (used / total) * 100}
+        if QUOTA_BYTES > 0:
+            mine = _storage_used_bytes()
+            out['quota'] = human_readable_size(QUOTA_BYTES)
+            out['quota_used'] = human_readable_size(mine)
+            out['quota_percent'] = (mine / QUOTA_BYTES) * 100 if QUOTA_BYTES else 0
+        return out
     except OSError:
         return {'used': '0 B', 'total': '0 B', 'percent': 0}
+
+
+# ================= 第 8 批：版本 / 审计 / 配额 / 只读挂载 / 全文搜索 / HLS / 离线下载 =================
+# --- 审计日志 ---
+AUDIT_FILE = os.path.join(SHARE_DIR, 'audit.log')
+_AUDIT_LOCK = threading.Lock()
+
+
+def _audit(action, path='', detail=''):
+    """操作记录：JSON 行追加，超 5MB 时只保留最后 5000 行。失败也不影响主流程。"""
+    try:
+        line = json.dumps({'ts': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                           'ip': request.remote_addr or '',
+                           'action': action, 'path': path, 'detail': detail},
+                          ensure_ascii=False) + '\n'
+        with _AUDIT_LOCK:
+            with open(AUDIT_FILE, 'a', encoding='utf-8') as f:
+                f.write(line)
+            if os.path.getsize(AUDIT_FILE) > 5 * 1024 * 1024:
+                with open(AUDIT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()[-5000:]
+                with open(AUDIT_FILE, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+    except OSError:
+        pass
+
+
+# --- 配额 ---
+QUOTA_BYTES = int(float(os.environ.get('QUOTA_GB', '0') or 0) * 1024 ** 3)
+
+
+def _storage_used_bytes():
+    total = 0
+    for dirpath, _dirs, files in os.walk(ROOT_DIR):
+        for name in files:
+            if '.davtmp.' in name:
+                continue
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                pass
+    return total
+
+
+def _quota_ok(additional=0):
+    """配额检查：没设配额永远通过；否则 已用 + 新增 <= 配额。"""
+    if QUOTA_BYTES <= 0:
+        return True, 0
+    used = _storage_used_bytes()
+    return used + additional <= QUOTA_BYTES, used
+
+
+# --- 文件版本 ---
+VERSIONS_DIR = os.path.join(SHARE_DIR, 'versions')
+VERSIONS_META_FILE = os.path.join(SHARE_DIR, 'versions.json')
+MAX_VERSIONS = 10
+
+
+class VersionManager(JsonManager):
+    def list_versions(self, rel):
+        with self._lock:
+            self.load_metadata()
+            return list(self.data.get(rel, []))
+
+    def add_version(self, rel, vid, size):
+        with self._lock:
+            self.load_metadata()
+            items = self.data.setdefault(rel, [])
+            items.append({'id': vid, 'mtime': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                          'size': human_readable_size(size)})
+            # 只留最近 10 个，旧的连文件一起删
+            while len(items) > MAX_VERSIONS:
+                old = items.pop(0)
+                try:
+                    os.remove(os.path.join(VERSIONS_DIR, hashlib.sha1(rel.encode()).hexdigest(), old['id']))
+                except OSError:
+                    pass
+            self.save_metadata()
+
+    def remove_version(self, rel, vid):
+        with self._lock:
+            self.load_metadata()
+            items = self.data.get(rel, [])
+            self.data[rel] = [v for v in items if v['id'] != vid]
+            if not self.data[rel]:
+                self.data.pop(rel, None)
+            self.save_metadata()
+
+
+version_manager = VersionManager(VERSIONS_META_FILE)
+
+
+def _save_version(rel):
+    """覆盖写文件前，把旧文件存一份版本。没有旧文件时什么都不做。"""
+    abs_path = safe_join(ROOT_DIR, rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return
+    vid = f"{int(time.time())}_{secrets.token_hex(4)}"
+    vdir = os.path.join(VERSIONS_DIR, hashlib.sha1(rel.encode()).hexdigest())
+    os.makedirs(vdir, exist_ok=True)
+    try:
+        shutil.copy2(abs_path, os.path.join(vdir, vid))
+        version_manager.add_version(rel, vid, os.path.getsize(abs_path))
+    except OSError:
+        pass
+
+
+def _version_abs(rel, vid):
+    vdir = os.path.join(VERSIONS_DIR, hashlib.sha1(rel.encode()).hexdigest())
+    cand = os.path.join(vdir, vid)
+    if os.path.isfile(cand) and vid.replace('_', '').replace('-', '').isalnum():
+        return cand
+    return None
+
+
+# --- 只读外部挂载 ---
+# 用法：容器里挂一个只读目录（如 compose 加 - /host/path:/mnt/external:ro），
+# 再设 READONLY_MOUNT_PATH=/mnt/external，网盘根目录就会多出一个“外部只读”文件夹，
+# 只能看、只能下，不能传、不能改、不能删。不设则功能 dormant。
+MOUNT_PATH = os.environ.get('READONLY_MOUNT_PATH', '')
+MOUNT_NAME = os.environ.get('READONLY_MOUNT_NAME', '外部只读') or '外部只读'
+MOUNT_ACTIVE = bool(MOUNT_PATH and os.path.isdir(MOUNT_PATH))
+
+
+def _is_mount_path(rel):
+    return MOUNT_ACTIVE and (rel == MOUNT_NAME or rel.startswith(MOUNT_NAME + '/'))
+
+
+def _mount_sub(rel):
+    return rel[len(MOUNT_NAME) + 1:] if rel.startswith(MOUNT_NAME + '/') else ''
+
+
+def _mount_abs(rel):
+    sub = _mount_sub(rel)
+    return safe_join(MOUNT_PATH, sub) if sub else MOUNT_PATH
+
+
+# --- 全文搜索（SQLite FTS5） ---
+SEARCH_DB = os.path.join(SHARE_DIR, 'search.db')
+TEXT_EXTS = {'.txt', '.md', '.json', '.yaml', '.yml', '.log', '.csv', '.html', '.css', '.js', '.py', '.sh', '.xml', '.ini', '.conf'}
+_SEARCH_LOCK = threading.Lock()
+
+
+def _search_signature():
+    count, max_mtime, total = 0, 0.0, 0
+    for dirpath, _dirs, files in os.walk(ROOT_DIR):
+        for name in files:
+            if '.davtmp.' in name:
+                continue
+            count += 1
+            try:
+                st = os.stat(os.path.join(dirpath, name))
+                max_mtime = max(max_mtime, st.st_mtime)
+                total += st.st_size
+            except OSError:
+                pass
+    return f'{count}:{max_mtime}:{total}'
+
+
+def _cjk_space(s):
+    """把每个汉字前后加空格：unicode61 会把连续汉字并成一个 token，
+    “爬山”搜不到“今天去爬山”；逐字隔开后，查询词按字组词组就能命中。
+    trigram 分词则直接忽略汉字，不能用。"""
+    out = []
+    for ch in s or '':
+        cp = ord(ch)
+        is_cjk = (0x4e00 <= cp <= 0x9fff or 0x3400 <= cp <= 0x4dbf or 0xf900 <= cp <= 0xfaff)
+        if is_cjk:
+            out.append(' ')
+            out.append(ch)
+            out.append(' ')
+        else:
+            out.append(ch)
+    return ' '.join(''.join(out).split())
+
+
+def _search_ensure_index():
+    """签名（文件数+最新 mtime+总大小）变了才重建索引；小盘全量重建也很快。"""
+    with _SEARCH_LOCK:
+        sig = _search_signature()
+        conn = sqlite3.connect(SEARCH_DB)
+        try:
+            conn.execute('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)')
+            row = conn.execute("SELECT v FROM meta WHERE k='sig2'").fetchone()
+            if row and row[0] == sig:
+                return conn
+            conn.execute('DROP TABLE IF EXISTS docs')
+            conn.execute("CREATE VIRTUAL TABLE docs USING fts5(path, name, tags, content, tokenize='unicode61')")
+            meta_map = file_meta_manager.get_map()
+            for dirpath, _dirs, files in os.walk(ROOT_DIR):
+                for name in files:
+                    if '.davtmp.' in name:
+                        continue
+                    abs_path = os.path.join(dirpath, name)
+                    rel = os.path.relpath(abs_path, ROOT_DIR).replace('\\', '/')
+                    tags = ' '.join((meta_map.get(rel) or {}).get('tags', []))
+                    content = ''
+                    if os.path.splitext(name)[1].lower() in TEXT_EXTS:
+                        try:
+                            if os.path.getsize(abs_path) <= 200 * 1024:
+                                with open(abs_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                    content = f.read()
+                        except OSError:
+                            pass
+                    conn.execute('INSERT INTO docs VALUES (?,?,?,?)',
+                                 (rel, _cjk_space(name), _cjk_space(tags), _cjk_space(content)))
+            conn.execute("INSERT OR REPLACE INTO meta VALUES ('sig2', ?)", (sig,))
+            conn.commit()
+            return conn
+        except sqlite3.Error:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            raise
+
+
+# --- HLS 720p 缓存代理 ---
+HLS_DIR = os.path.join(SHARE_DIR, 'hls')
+_HLS_JOBS = {}  # {hid: {'status': 'generating'|'ready'|'failed', 'error': str}}
+_HLS_LOCK = threading.Lock()
+
+
+def _hls_id(rel):
+    abs_path = safe_join(ROOT_DIR, rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return None
+    st = os.stat(abs_path)
+    return hashlib.sha1(f'{rel}:{st.st_mtime}:{st.st_size}'.encode()).hexdigest()[:16]
+
+
+def _hls_transcode(rel, hid):
+    """后台转码：ffmpeg 写分片，playlist 边转边长，播起来不用等转完。"""
+    abs_path = safe_join(ROOT_DIR, rel)
+    outdir = os.path.join(HLS_DIR, hid)
+    os.makedirs(outdir, exist_ok=True)
+    lockfile = os.path.join(outdir, '.lock')
+    try:
+        with open(lockfile, 'w') as lf:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return  # 别的 worker 正在转同一份
+            proc = subprocess.run(
+                ['ffmpeg', '-y', '-i', abs_path,
+                 '-vf', 'scale=-2:720', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+                 '-c:a', 'aac', '-b:a', '128k',
+                 '-hls_time', '6', '-hls_playlist_type', 'vod',
+                 '-hls_segment_filename', os.path.join(outdir, 'seg%03d.ts'),
+                 os.path.join(outdir, 'playlist.m3u8')],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=86400)
+            with _HLS_LOCK:
+                _HLS_JOBS[hid] = {'status': 'ready' if proc.returncode == 0 else 'failed',
+                                  'error': '' if proc.returncode == 0 else f'ffmpeg 退出码 {proc.returncode}'}
+    except (OSError, subprocess.TimeoutExpired) as e:
+        with _HLS_LOCK:
+            _HLS_JOBS[hid] = {'status': 'failed', 'error': str(e)}
+
+
+# --- aria2 离线下载 ---
+OFFLINE_FILE = os.path.join(SHARE_DIR, 'offline.json')
+ARIA2_RPC = 'http://127.0.0.1:6800/jsonrpc'
+ARIA2_SECRET = os.environ.get('ARIA2_SECRET') or os.environ.get('SECRET_KEY', '')
+_aria2_ok_cache = {'ok': None, 'at': 0}
+
+
+class OfflineManager(JsonManager):
+    def list_tasks(self):
+        with self._lock:
+            self.load_metadata()
+            return list(self.data.get('tasks', []))
+
+    def add_task(self, task):
+        with self._lock:
+            self.load_metadata()
+            self.data.setdefault('tasks', []).insert(0, task)
+            self.data['tasks'] = self.data['tasks'][:50]
+            self.save_metadata()
+
+    def update_task(self, gid, **fields):
+        with self._lock:
+            self.load_metadata()
+            for t in self.data.get('tasks', []):
+                if t.get('gid') == gid:
+                    t.update(fields)
+            self.save_metadata()
+
+    def remove_task(self, gid):
+        with self._lock:
+            self.load_metadata()
+            self.data['tasks'] = [t for t in self.data.get('tasks', []) if t.get('gid') != gid]
+            self.save_metadata()
+
+
+offline_manager = OfflineManager(OFFLINE_FILE)
+
+
+def _aria2_rpc(method, params=None):
+    """调 aria2 JSON-RPC；aria2 没起时抛错，调用方转 503。"""
+    if not ARIA2_SECRET:
+        raise ConnectionError('aria2 未配置')
+    payload = json.dumps({'jsonrpc': '2.0', 'id': uuid.uuid4().hex,
+                          'method': method,
+                          'params': [f'token:{ARIA2_SECRET}'] + (params or [])}).encode()
+    req = urllib.request.Request(ARIA2_RPC, data=payload, headers={'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        out = json.loads(resp.read())
+    if 'error' in out:
+        raise ConnectionError(out['error'].get('message', 'aria2 错误'))
+    return out.get('result')
+
+
+def _aria2_available():
+    now = time.monotonic()
+    if _aria2_ok_cache['ok'] is not None and now - _aria2_ok_cache['at'] < 60:
+        return _aria2_ok_cache['ok']
+    try:
+        _aria2_rpc('aria2.getVersion')
+        ok = True
+    except Exception:
+        ok = False
+    _aria2_ok_cache.update({'ok': ok, 'at': now})
+    return ok
 
 def clean_old_archives():
     # 修复旧 bug：tasks.py 生成的是 archive_*.zip，旧代码却清 batch_download_*.zip，
@@ -852,8 +1186,10 @@ def login_api():
         _login_ok(ip)
         session['logged_in'] = True
         session.permanent = True
+        _audit('登录成功')
         return jsonify({'status': 'success'})
     _login_failed(ip)
+    _audit('登录失败', detail='账号或密码错误')
     return jsonify({'status': 'fail', 'message': '账号或密码错误'}), 401
 
 
@@ -1273,6 +1609,9 @@ def extract_archive():
             base = base[:-len(suffix)]
             break
     dest = _unique_dir(os.path.dirname(abs_path), base or '解压')
+    ok, used = _quota_ok(total)
+    if not ok:
+        return jsonify({'error': f'配额已满（已用 {human_readable_size(used)} / {human_readable_size(QUOTA_BYTES)}）'}), 413
     os.makedirs(dest, exist_ok=True)
     extracted, skipped = 0, []
     try:
@@ -1303,6 +1642,7 @@ def extract_archive():
     except Exception as e:
         return jsonify({'error': f'解压失败: {e}', 'dest': os.path.relpath(dest, ROOT_DIR).replace('\\', '/'),
                         'extracted': extracted, 'skipped': skipped}), 500
+    _audit('解压', rel, f'{extracted} 个文件')
     return jsonify({'status': 'success',
                     'dest': os.path.relpath(dest, ROOT_DIR).replace('\\', '/'),
                     'extracted': extracted, 'skipped': skipped})
@@ -1464,12 +1804,17 @@ def webdav(rel):
         parent = os.path.dirname(abs_path)
         if not os.path.isdir(parent):
             return '父文件夹不存在', 409
+        ok, used = _quota_ok(request.content_length or 0)
+        if not ok:
+            return f'配额已满（已用 {human_readable_size(used)} / {human_readable_size(QUOTA_BYTES)}）', 413
         existed = os.path.exists(abs_path)
         # request.stream 直写磁盘，避免大文件先读进内存
         tmp = abs_path + f'.davtmp.{os.getpid()}'
         try:
             with open(tmp, 'wb') as out:
                 shutil.copyfileobj(request.stream, out, 1024 * 1024)
+            if existed:
+                _save_version(rel)
             os.replace(tmp, abs_path)
         except OSError as e:
             try:
@@ -1477,6 +1822,7 @@ def webdav(rel):
             except OSError:
                 pass
             return f'写入失败: {e}', 500
+        _audit('WebDAV 上传' if not existed else 'WebDAV 覆盖', rel)
         return ('', 204) if existed else ('', 201)
 
     if method == 'MKCOL':
@@ -1502,6 +1848,7 @@ def webdav(rel):
         except OSError as e:
             return f'删除失败: {e}', 500
         # 标签/收藏保留在元数据里，还原后还在（与网页端删除一致；彻底删除时才清）
+        _audit('WebDAV 删除', rel)
         return '', 204
 
     if method in ('MOVE', 'COPY'):
@@ -1609,6 +1956,24 @@ def webdav(rel):
 @auth_required
 def list_files():
     req_path = request.args.get('path', '')
+    # 只读外部挂载：根目录多出一个虚拟文件夹，里面只能看不能改
+    if _is_mount_path(req_path):
+        mount_abs = _mount_abs(req_path)
+        if not mount_abs or not os.path.isdir(mount_abs):
+            return jsonify({'files': [], 'usage': get_disk_usage()})
+        files = []
+        try:
+            with os.scandir(mount_abs) as entries:
+                for entry in sorted(entries, key=lambda e: (not e.is_dir(), e.name)):
+                    stat = entry.stat()
+                    rel = f"{req_path}/{entry.name}"
+                    files.append({'name': entry.name, 'is_dir': entry.is_dir(),
+                                  'size': human_readable_size(stat.st_size) if not entry.is_dir() else '-',
+                                  'mtime': time.strftime('%Y-%m-%d %H:%M', time.localtime(stat.st_mtime)),
+                                  'path': rel, 'tags': [], 'fav': False, 'readonly': True})
+        except OSError:
+            pass
+        return jsonify({'files': files, 'usage': get_disk_usage(), 'mount': True})
     abs_path = safe_join(ROOT_DIR, req_path) if req_path else ROOT_DIR
     if abs_path is None:
         return jsonify({'error': 'Invalid path'}), 400
@@ -1630,7 +1995,14 @@ def list_files():
                 files.append({'name': entry.name, 'is_dir': entry.is_dir(), 'size': human_readable_size(stat.st_size) if not entry.is_dir() else '-', 'mtime': time.strftime('%Y-%m-%d %H:%M', time.localtime(stat.st_mtime)), 'path': rel, 'tags': m.get('tags', []), 'fav': bool(m.get('fav'))})
     except OSError:
         pass
-    return jsonify({'files': sorted(files, key=lambda x: (not x['is_dir'], x['name'])), 'usage': get_disk_usage()})
+    files = sorted(files, key=lambda x: (not x['is_dir'], x['name']))
+    if not req_path and MOUNT_ACTIVE:
+        files.insert(0, {'name': MOUNT_NAME, 'is_dir': True, 'size': '-', 'mtime': '',
+                         'path': MOUNT_NAME, 'tags': [], 'fav': False, 'is_mount': True})
+    out = {'files': files, 'usage': get_disk_usage()}
+    if MOUNT_ACTIVE:
+        out['mount_name'] = MOUNT_NAME
+    return jsonify(out)
 
 @app.route('/api/thumb')
 @auth_required
@@ -1866,6 +2238,8 @@ def operate_items():
     action = data.get('action')
     if action not in ('move', 'copy'):
         return jsonify({'error': 'Invalid action'}), 400
+    if _is_mount_path(data.get('dest', '')) or any(_is_mount_path(p) for p in data.get('files', [])):
+        return jsonify({'error': '只读挂载，不可移动/复制'}), 403
     dest_abs = safe_join(ROOT_DIR, data.get('dest', '')) if data.get('dest', '') else ROOT_DIR
     if dest_abs is None or not os.path.isdir(dest_abs):
         return jsonify({'error': 'Dest not found'}), 404
@@ -1895,6 +2269,8 @@ def operate_items():
             success += 1
         except Exception as e:
             errors.append(str(e))
+    if success:
+        _audit('移动' if action == 'move' else '复制', ', '.join(data.get('files', [])[:3]), f'目标: {data.get("dest", "")}')
     return jsonify({'success': success, 'errors': errors})
 
 @app.route('/api/share/create', methods=['POST'])
@@ -1995,8 +2371,11 @@ def cancel_drop_link():
 @app.route('/api/delete', methods=['POST'])
 @auth_required
 def soft_delete():
+    files = get_json().get('files', [])
     count = 0
-    for p in get_json().get('files', []):
+    for p in files:
+        if _is_mount_path(p):
+            continue
         src = safe_join(ROOT_DIR, p)
         if not src or not os.path.exists(src):
             continue
@@ -2012,6 +2391,8 @@ def soft_delete():
             count += 1
         except OSError:
             pass
+    if count:
+        _audit('删除', ', '.join(files[:3]), f'{count} 项进回收站')
     return jsonify({'status': 'success', 'count': count})
 
 @app.route('/api/trash/list')
@@ -2089,9 +2470,17 @@ def upload_file():
     save_dir = safe_join(ROOT_DIR, request.form.get('path', '')) if request.form.get('path', '') else ROOT_DIR
     if save_dir is None:
         return jsonify({'error': 'Invalid path'}), 400
+    if _is_mount_path(request.form.get('path', '')):
+        return jsonify({'error': '只读挂载，不可上传'}), 403
+    ok, used = _quota_ok(request.content_length or 0)
+    if not ok:
+        return jsonify({'error': f'配额已满（已用 {human_readable_size(used)} / {human_readable_size(QUOTA_BYTES)}）'}), 413
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
+    rel = (request.form.get('path', '') + '/' + filename).strip('/') if request.form.get('path', '') else filename
+    _save_version(rel)
     file.save(os.path.join(save_dir, filename))
+    _audit('上传', rel)
     return jsonify({'status': 'success'})
 
 
@@ -2118,6 +2507,11 @@ def upload_init():
     save_dir = safe_join(ROOT_DIR, rel_path) if rel_path else ROOT_DIR
     if save_dir is None:
         return jsonify({'error': 'Invalid path'}), 400
+    if _is_mount_path(rel_path):
+        return jsonify({'error': '只读挂载，不可上传'}), 403
+    ok, used = _quota_ok(size)
+    if not ok:
+        return jsonify({'error': f'配额已满（已用 {human_readable_size(used)} / {human_readable_size(QUOTA_BYTES)}）'}), 413
     _cleanup_stale_uploads()
     # 断点续传：前端带回上次的 upload_id 且元数据一致时复用，已传分片不用重传
     upload_id = data.get('upload_id') or ''
@@ -2193,6 +2587,8 @@ def upload_complete():
         return jsonify({'error': 'Invalid path'}), 400
     os.makedirs(save_dir, exist_ok=True)
     final_path = os.path.join(save_dir, meta['name'])
+    final_rel = (rel_path + '/' + meta['name']).strip('/') if rel_path else meta['name']
+    _save_version(final_rel)
     d = _upload_dir(upload_id)
     try:
         with open(final_path, 'wb') as out:
@@ -2206,6 +2602,7 @@ def upload_complete():
             return jsonify({'error': 'Size mismatch after merge'}), 400
     finally:
         shutil.rmtree(d, ignore_errors=True)
+    _audit('上传', final_rel)
     return jsonify({'status': 'success'})
 
 
@@ -2266,10 +2663,267 @@ def download_result_file():
         return jsonify({'error': 'Invalid file'}), 400
     return send_file(resolved, as_attachment=True, download_name=name, conditional=True)
 
+# ================= 第 8 批接口：版本 / 文本编辑 / 全文搜索 / 审计 / 离线下载 / HLS =================
+@app.route('/api/versions')
+@auth_required
+def list_versions():
+    rel = (request.args.get('path') or '').replace('\\', '/')
+    abs_path = safe_join(ROOT_DIR, rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return jsonify({'error': '文件不存在'}), 404
+    return jsonify({'path': rel, 'versions': version_manager.list_versions(rel)})
+
+
+@app.route('/api/versions/restore', methods=['POST'])
+@auth_required
+def restore_version():
+    data = get_json()
+    rel = (data.get('path') or '').replace('\\', '/')
+    vid = data.get('version_id', '')
+    abs_path = safe_join(ROOT_DIR, rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return jsonify({'error': '文件不存在'}), 404
+    src = _version_abs(rel, vid)
+    if not src:
+        return jsonify({'error': '版本不存在'}), 404
+    _save_version(rel)  # 还原前先把当前版也存一份，免得还原本身丢数据
+    shutil.copy2(src, abs_path)
+    _audit('还原版本', rel, vid)
+    return jsonify({'status': 'success'})
+
+
+@app.route('/api/versions/delete', methods=['POST'])
+@auth_required
+def delete_version():
+    data = get_json()
+    rel = (data.get('path') or '').replace('\\', '/')
+    vid = data.get('version_id', '')
+    src = _version_abs(rel, vid)
+    if not src:
+        return jsonify({'error': '版本不存在'}), 404
+    try:
+        os.remove(src)
+    except OSError:
+        pass
+    version_manager.remove_version(rel, vid)
+    return jsonify({'status': 'success'})
+
+
+@app.route('/api/text')
+@auth_required
+def get_text():
+    rel = (request.args.get('path') or '').replace('\\', '/')
+    if _is_mount_path(rel):
+        abs_path = _mount_abs(rel)
+    else:
+        abs_path = safe_join(ROOT_DIR, rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return jsonify({'error': '文件不存在'}), 404
+    if os.path.splitext(rel)[1].lower() not in TEXT_EXTS:
+        return jsonify({'error': '不是可编辑的文本文件'}), 400
+    if os.path.getsize(abs_path) > 2 * 1024 * 1024:
+        return jsonify({'error': '文件超过 2MB，不能在线编辑'}), 400
+    with open(abs_path, 'r', encoding='utf-8', errors='replace') as f:
+        return jsonify({'path': rel, 'content': f.read(), 'readonly': _is_mount_path(rel)})
+
+
+@app.route('/api/text', methods=['POST'])
+@auth_required
+def save_text():
+    data = get_json()
+    rel = (data.get('path') or '').replace('\\', '/')
+    content = data.get('content')
+    if not isinstance(content, str) or len(content.encode('utf-8')) > 2 * 1024 * 1024:
+        return jsonify({'error': '内容为空或超过 2MB'}), 400
+    if _is_mount_path(rel):
+        return jsonify({'error': '只读挂载，不可修改'}), 403
+    abs_path = safe_join(ROOT_DIR, rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return jsonify({'error': '文件不存在'}), 404
+    if os.path.splitext(rel)[1].lower() not in TEXT_EXTS:
+        return jsonify({'error': '不是可编辑的文本文件'}), 400
+    _save_version(rel)
+    with open(abs_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    _audit('编辑文件', rel)
+    return jsonify({'status': 'success'})
+
+
+@app.route('/api/search')
+@auth_required
+def full_search():
+    q = (request.args.get('q') or '').strip()
+    if not q:
+        return jsonify({'results': []})
+    if len(q) > 200:
+        return jsonify({'error': '搜索词太长'}), 400
+    try:
+        conn = _search_ensure_index()
+        # 查询词同样逐字隔开、包成一个短语，防止 FTS5 语法注入（如 OR、*、引号）
+        phrase = '"' + _cjk_space(q).replace('"', '""') + '"'
+        if not _cjk_space(q):
+            return jsonify({'results': []})
+        rows = conn.execute(
+            "SELECT path, snippet(docs, 3, '【', '】', '…', 32) FROM docs "
+            "WHERE docs MATCH ? ORDER BY rank LIMIT 50", (phrase,)).fetchall()
+        conn.close()
+    except sqlite3.Error as e:
+        return jsonify({'error': f'搜索失败: {e}'}), 500
+    out = []
+    for path, snippet in rows:
+        abs_path = safe_join(ROOT_DIR, path)
+        # snippet 里汉字是逐字隔开的，展示前把汉字间的空格拼回去
+        snippet = re.sub(r'(?<=[\u4e00-\u9fff]) (?=[\u4e00-\u9fff])', '', snippet or '')
+        # name 列存的是分词后的文本，只用于搜索；展示用 path 里的真文件名
+        out.append({'path': path, 'name': os.path.basename(path), 'snippet': snippet,
+                    'is_dir': False,
+                    'size': human_readable_size(os.path.getsize(abs_path)) if abs_path and os.path.isfile(abs_path) else '',
+                    'mtime': time.strftime('%Y-%m-%d %H:%M', time.localtime(os.path.getmtime(abs_path))) if abs_path and os.path.exists(abs_path) else ''})
+    return jsonify({'results': out})
+
+
+@app.route('/api/audit')
+@auth_required
+def audit_list():
+    try:
+        limit = max(1, min(200, int(request.args.get('limit', 100))))
+    except ValueError:
+        limit = 100
+    items = []
+    try:
+        with open(AUDIT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()[-limit:]
+        for line in reversed(lines):
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        pass
+    return jsonify(items)
+
+
+@app.route('/api/offline/list')
+@auth_required
+def offline_list():
+    tasks = offline_manager.list_tasks()
+    live = {}
+    if _aria2_available():
+        try:
+            for t in _aria2_rpc('aria2.tellActive') or []:
+                live[t['gid']] = t
+            for t in _aria2_rpc('aria2.tellWaiting', [0, 50]) or []:
+                live[t['gid']] = t
+        except Exception:
+            pass
+    out = []
+    for t in tasks:
+        item = dict(t)
+        st = live.get(t['gid'])
+        if st:
+            total = int(st.get('totalLength') or 0)
+            done = int(st.get('completedLength') or 0)
+            item['status'] = st.get('status', t['status'])
+            item['progress'] = round(done / total * 100, 1) if total else 0
+            item['speed'] = human_readable_size(int(st.get('downloadSpeed') or 0)) + '/s'
+        out.append(item)
+    return jsonify({'aria2': _aria2_available(), 'tasks': out})
+
+
+@app.route('/api/offline/add', methods=['POST'])
+@auth_required
+def offline_add():
+    data = get_json()
+    url = (data.get('url') or '').strip()
+    if not (url.startswith('http://') or url.startswith('https://') or url.startswith('magnet:?')):
+        return jsonify({'error': '只支持 http(s) 链接和磁力链接'}), 400
+    if not _aria2_available():
+        return jsonify({'error': 'aria2 未运行（容器里没起起来，等部署后重试）'}), 503
+    dest = (data.get('path') or '').replace('\\', '/').strip('/')
+    save_dir = safe_join(ROOT_DIR, dest) if dest else ROOT_DIR
+    if save_dir is None or not os.path.isdir(save_dir):
+        return jsonify({'error': '目标文件夹不存在'}), 400
+    try:
+        gid = _aria2_rpc('aria2.addUri', [[url], {'dir': os.path.join(SHARE_DIR, 'downloads')}])
+    except Exception as e:
+        return jsonify({'error': f'aria2 添加失败: {e}'}), 500
+    offline_manager.add_task({'gid': gid, 'url': url, 'dest': dest,
+                              'status': 'active', 'progress': 0,
+                              'created': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())})
+    _audit('离线下载', dest, url[:120])
+    return jsonify({'status': 'success', 'gid': gid})
+
+
+@app.route('/api/offline/cancel', methods=['POST'])
+@auth_required
+def offline_cancel():
+    data = get_json()
+    gid = data.get('gid', '')
+    if _aria2_available():
+        try:
+            _aria2_rpc('aria2.remove', [gid])
+        except Exception:
+            pass
+    offline_manager.remove_task(gid)
+    return jsonify({'status': 'success'})
+
+
+@app.route('/api/hls/start', methods=['POST'])
+@auth_required
+def hls_start():
+    if not shutil.which('ffmpeg'):
+        return jsonify({'error': 'ffmpeg 未安装（重新部署后可用）'}), 503
+    rel = (get_json().get('path') or '').replace('\\', '/')
+    abs_path = safe_join(ROOT_DIR, rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return jsonify({'error': '文件不存在'}), 404
+    if not rel.lower().endswith(('.mp4', '.mov', '.mkv', '.webm')):
+        return jsonify({'error': '不是视频文件'}), 400
+    hid = _hls_id(rel)
+    playlist = os.path.join(HLS_DIR, hid, 'playlist.m3u8')
+    with _HLS_LOCK:
+        job = _HLS_JOBS.get(hid)
+    if os.path.isfile(playlist) and job and job['status'] == 'ready':
+        return jsonify({'hid': hid, 'status': 'ready'})
+    if not job or job['status'] == 'failed':
+        with _HLS_LOCK:
+            _HLS_JOBS[hid] = {'status': 'generating', 'error': ''}
+        threading.Thread(target=_hls_transcode, args=(rel, hid), daemon=True).start()
+    return jsonify({'hid': hid, 'status': 'generating'})
+
+
+@app.route('/api/hls/<hid>/playlist.m3u8')
+@auth_required
+def hls_playlist(hid):
+    if not re.fullmatch(r'[0-9a-f]{16}', hid or ''):
+        return '非法请求', 400
+    playlist = os.path.join(HLS_DIR, hid, 'playlist.m3u8')
+    if not os.path.isfile(playlist):
+        return jsonify({'error': '还在转码，请稍后重试'}), 202
+    resp = send_file(playlist, mimetype='application/vnd.apple.mpegurl')
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
+
+
+@app.route('/api/hls/<hid>/<seg>')
+@auth_required
+def hls_segment(hid, seg):
+    if not re.fullmatch(r'[0-9a-f]{16}', hid or '') or not re.fullmatch(r'seg\d+\.ts', seg or ''):
+        return '非法请求', 400
+    path = os.path.join(HLS_DIR, hid, seg)
+    if not os.path.isfile(path):
+        return '分片不存在', 404
+    return send_file(path, mimetype='video/MP2T')
+
+
 @app.route('/api/file')
 @auth_required
 def get_file_content():
-    abs_path = safe_join(ROOT_DIR, request.args.get('path', ''))
+    rel = (request.args.get('path', '')).replace('\\', '/')
+    if _is_mount_path(rel):
+        abs_path = _mount_abs(rel)
+    else:
+        abs_path = safe_join(ROOT_DIR, rel)
     if not abs_path or not os.path.isfile(abs_path):
         return jsonify({'error': 'File not found'}), 404
     # conditional=True：Werkzeug 处理 Range 请求回 206 + Content-Range，
