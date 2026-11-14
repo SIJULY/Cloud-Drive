@@ -146,6 +146,58 @@
         .video-close-btn { position: absolute; top: 20px; right: 20px; color: white; font-size: 24px; cursor: pointer; opacity: 0.7; z-index: 1001; }
         .video-close-btn:hover { opacity: 1; }
     </style>
+    <style>
+        /* ============ 现代化覆盖层（2026-11-14）：后加载，优先级高于上方旧规则 ============ */
+        :root { --brand: #4f46e5; --brand-2: #7c3aed; --ink: #0f172a; --muted: #64748b; --line: #e8eaf2; --bg: #f4f5fb; }
+        body { background: var(--bg); color: var(--ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; }
+        /* 侧边栏 */
+        #app > .sidebar { background: #fff; border-right: 1px solid var(--line); }
+        #app .brand-mark { width: 56px; height: 56px; border-radius: 18px; background: linear-gradient(135deg, var(--brand), var(--brand-2)); color: #fff; box-shadow: 0 8px 20px rgba(79,70,229,.35); }
+        #app .nav-item { border-right: none; border-radius: 12px; color: #475569; font-weight: 500; }
+        #app .nav-item:hover { background: #f1f2fa; color: var(--brand); }
+        #app .nav-item.active { background: #eef2ff; color: var(--brand); border-right: none; font-weight: 600; box-shadow: inset 3px 0 0 var(--brand); }
+        #app .nav-item.active i { color: var(--brand) !important; }
+        #app .storage-bar { background: linear-gradient(90deg, var(--brand), var(--brand-2)); }
+        /* 顶栏 */
+        #app .topbar { background: rgba(255,255,255,.92); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); box-shadow: none; }
+        /* 图标按钮：浅灰底 + 深色图标，永远看得见；禁用态半透明但仍有形状 */
+        #app .icon-btn { width: 36px; height: 36px; border-radius: 12px; background: #eef0f7; color: #334155; display: inline-flex; align-items: center; justify-content: center; font-size: 15px; transition: all .15s; border: 1px solid transparent; flex-shrink: 0; }
+        #app .icon-btn:hover { background: #e2e5f1; color: var(--ink); }
+        #app .icon-btn:disabled { opacity: .45; cursor: not-allowed; }
+        #app .icon-btn i { color: inherit; }
+        /* 分段切换（列表/宫格）：灰底轨道，激活项白底深色图标 */
+        #app .seg-control { display: inline-flex; align-items: center; gap: 2px; background: #eef0f7; border: 1px solid var(--line); border-radius: 12px; padding: 3px; }
+        #app .seg-btn { width: 34px; height: 30px; border-radius: 9px; display: inline-flex; align-items: center; justify-content: center; font-size: 14px; color: #64748b; transition: all .15s; }
+        #app .seg-btn:hover { color: var(--ink); }
+        #app .seg-btn.on { background: #fff; color: var(--brand); box-shadow: 0 1px 3px rgba(15,23,42,.15); }
+        #app .seg-btn i { color: inherit; }
+        /* 胶囊按钮 */
+        #app .btn-pill { height: 38px; border-radius: 12px; font-weight: 600; box-shadow: 0 1px 2px rgba(15,23,42,.06); }
+        #app .btn-pill i { color: inherit; }
+        #app .btn-primary { background: linear-gradient(135deg, var(--brand), var(--brand-2)); color: #fff; border-color: transparent; box-shadow: 0 6px 16px rgba(79,70,229,.35); }
+        #app .btn-primary:hover { background: linear-gradient(135deg, #4338ca, #6d28d9); color: #fff; border-color: transparent; }
+        #app .btn-danger { color: #dc2626; border-color: #fecaca; background: #fff; }
+        #app .btn-danger:hover { color: #b91c1c; background: #fef2f2; border-color: #fca5a5; }
+        /* 文件卡片 */
+        #app .grid-card { border-radius: 18px; border: 1px solid var(--line); box-shadow: 0 1px 2px rgba(15,23,42,.05); overflow: hidden; }
+        #app .grid-card:hover { transform: translateY(-3px); box-shadow: 0 12px 24px -8px rgba(15,23,42,.18); border-color: #c7d2fe; }
+        #app .grid-card.selected { background: #eef2ff; border-color: var(--brand); box-shadow: 0 0 0 2px rgba(79,70,229,.35); }
+        #app .card-preview { position: relative; width: 100%; height: 132px; background: #eef0f7; border-radius: 12px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+        #app .card-preview img, #app .card-preview video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+        #app .card-preview .file-glyph { font-size: 44px; }
+        #app .play-badge { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+        #app .play-badge span { width: 44px; height: 44px; border-radius: 9999px; background: rgba(15,23,42,.55); backdrop-filter: blur(2px); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 16px; padding-left: 3px; }
+        #app .grid-card:hover .play-badge span { background: var(--brand); transform: scale(1.08); }
+        #app .type-chip { position: absolute; top: 8px; right: 8px; font-size: 10px; font-weight: 700; letter-spacing: .04em; padding: 2px 7px; border-radius: 9999px; background: rgba(255,255,255,.92); color: #475569; box-shadow: 0 1px 3px rgba(15,23,42,.15); text-transform: uppercase; }
+        #app .list-row:hover { background: #f8f9ff; }
+        #app .list-row.selected { background: #eef2ff; }
+        /* 抽屉 / Toast */
+        #app .drawer { width: 440px; border-radius: 20px 0 0 20px; box-shadow: -12px 0 40px rgba(15,23,42,.15); }
+        #app .toast { background: rgba(15,23,42,.94); border-radius: 12px; box-shadow: 0 12px 30px rgba(15,23,42,.3); }
+        #app .search-input { background: #eef0f7; border: 1px solid transparent; }
+        #app .search-input:focus { background: #fff; border-color: #c7d2fe; box-shadow: 0 0 0 3px rgba(79,70,229,.12); }
+        ::selection { background: #c7d2fe; }
+    </style>
 </head>
 <body class="text-gray-700">
 
@@ -195,9 +247,9 @@
             <div class="dropdown-item danger" @click="handleMoreAction('delete')"><i class="fa-solid fa-trash"></i> 删除</div>
         </div>
 
-        <div class="w-64 bg-white flex flex-col border-r border-gray-200 flex-shrink-0 z-20">
+        <div class="sidebar w-64 bg-white flex flex-col border-r border-gray-200 flex-shrink-0 z-20">
             <div class="pt-8 pb-6 px-6 text-center">
-                <div class="w-20 h-20 mx-auto bg-gradient-to-br from-blue-50 to-blue-100 rounded-full flex items-center justify-center text-blue-500 text-3xl mb-4 shadow-inner border border-blue-100">
+                <div class="brand-mark mx-auto flex items-center justify-center text-2xl mb-4">
                     <i class="fa-solid fa-cloud"></i>
                 </div>
                 <h3 class="font-bold text-gray-800 text-lg">我的云盘 Pro</h3>
@@ -249,8 +301,8 @@
                     <span class="text-xs font-semibold text-gray-500">存储空间</span>
                     <span class="text-xs text-blue-600 font-bold">[[ usage.percent ? usage.percent.toFixed(0) : 0 ]]%</span>
                 </div>
-                <div class="w-full bg-gray-100 rounded-full h-1.5 mb-2 overflow-hidden">
-                    <div class="bg-blue-600 h-1.5 rounded-full transition-all duration-500 ease-out" :style="{width: usage.percent + '%'}"></div>
+                <div class="w-full bg-gray-100 rounded-full h-2 mb-2 overflow-hidden">
+                    <div class="storage-bar bg-blue-600 h-2 rounded-full transition-all duration-500 ease-out" :style="{width: usage.percent + '%'}"></div>
                 </div>
                 <div class="text-xs text-gray-400 flex justify-between">
                     <span>已用 [[ usage.used ]]</span>
@@ -260,20 +312,20 @@
         </div>
 
         <div class="flex-1 flex flex-col bg-white overflow-hidden relative">
-            <div class="h-16 border-b border-gray-200 flex items-center justify-between px-6 bg-white z-10 shadow-sm">
-                <div class="flex items-center space-x-4">
-                    <div class="flex items-center border border-gray-200 rounded-full bg-white h-9 shadow-sm hover:shadow transition">
-                        <button @click="goUp" :disabled="!path || currentTab !== 'files'" class="px-3 h-full hover:bg-gray-50 rounded-l-full text-gray-500 disabled:opacity-30 transition border-r border-gray-100">
+            <div class="topbar h-16 border-b border-gray-200 flex items-center justify-between px-6 bg-white z-10 shadow-sm">
+                <div class="flex items-center space-x-3">
+                    <div class="flex items-center space-x-2">
+                        <button @click="goUp" :disabled="!path || currentTab !== 'files'" class="icon-btn" title="返回上一级">
                             <i class="fa-solid fa-angle-left"></i>
                         </button>
-                        <button class="px-3 h-full hover:bg-gray-50 rounded-r-full text-gray-500 transition cursor-default">
+                        <button class="icon-btn" disabled title="前进">
                              <i class="fa-solid fa-angle-right"></i>
                         </button>
                     </div>
 
                     <div class="flex items-center space-x-3 ml-2">
                         <template v-if="currentTab === 'files'">
-                            <button @click="triggerUpload" class="btn-pill bg-blue-600 text-white border-blue-600 hover:bg-blue-700 hover:text-white hover:border-blue-700 shadow-sm shadow-blue-200">
+                            <button @click="triggerUpload" class="btn-pill btn-primary">
                                 <i class="fa-solid fa-cloud-arrow-up"></i> 上传
                             </button>
                             <button @click="createFolder" class="btn-pill">
@@ -289,6 +341,9 @@
                             </button>
                             <button @click="downloadSelected" class="btn-pill text-blue-600 hover:bg-blue-50 hover:border-blue-200">
                                 <i class="fa-solid fa-download"></i> 下载
+                            </button>
+                            <button @click="handleMoreAction('delete')" class="btn-pill btn-danger" title="删除选中项（移入回收站，可还原）">
+                                <i class="fa-solid fa-trash"></i> 删除
                             </button>
                             
                             <div class="relative" @click.stop>
@@ -320,21 +375,21 @@
                     <div class="relative group">
                         <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-gray-400 text-xs group-focus-within:text-blue-500 transition-colors"></i>
                         <input type="text" v-model="searchQuery" placeholder="搜索文件..." 
-                               class="pl-9 pr-8 py-2 bg-gray-100 rounded-full text-sm focus:bg-white focus:ring-2 focus:ring-blue-100 focus:border-blue-400 outline-none w-48 transition-all hover:bg-gray-200 focus:w-64 placeholder-gray-400 border border-transparent">
+                               class="search-input pl-9 pr-8 py-2 rounded-full text-sm focus:ring-2 focus:ring-blue-100 outline-none w-48 transition-all focus:w-64 placeholder-gray-400 border border-transparent">
                         <button v-if="searchQuery" @click="searchQuery = ''" class="absolute right-2.5 top-2.5 text-gray-400 hover:text-gray-600">
                             <i class="fa-solid fa-circle-xmark text-sm"></i>
                         </button>
                     </div>
                     
-                    <div class="flex items-center bg-gray-100 rounded-lg p-1 ml-2 border border-gray-200">
-                        <button @click="viewMode = 'list'" :class="{'bg-white text-gray-800 shadow-sm': viewMode === 'list'}" class="w-8 h-7 rounded-md flex items-center justify-center transition text-sm text-gray-400 hover:text-gray-600">
+                    <div class="seg-control ml-2" role="group" aria-label="视图切换">
+                        <button @click="viewMode = 'list'" :class="{'on': viewMode === 'list'}" class="seg-btn" title="列表视图">
                             <i class="fa-solid fa-bars"></i>
                         </button>
-                        <button @click="viewMode = 'grid'" :class="{'bg-white text-gray-800 shadow-sm': viewMode === 'grid'}" class="w-8 h-7 rounded-md flex items-center justify-center transition text-sm text-gray-400 hover:text-gray-600">
+                        <button @click="viewMode = 'grid'" :class="{'on': viewMode === 'grid'}" class="seg-btn" title="宫格视图">
                             <i class="fa-solid fa-border-all"></i>
                         </button>
                     </div>
-                    <button @click="loadFiles(path)" class="text-gray-400 hover:text-blue-600 transition w-8 h-8 flex items-center justify-center hover:bg-gray-100 rounded-full"><i class="fa-solid fa-rotate-right"></i></button>
+                    <button @click="loadFiles(path)" class="icon-btn" title="刷新"><i class="fa-solid fa-rotate-right"></i></button>
                 </div>
             </div>
 
@@ -397,8 +452,13 @@
                                         <input type="checkbox" v-model="selectedFiles" :value="file.path" class="rounded text-blue-600 focus:ring-0 cursor-pointer">
                                     </td>
                                     <td class="py-3 flex items-center">
-                                        <i :class="getFileIcon(file)" class="mr-3 text-xl w-6 text-center"></i>
-                                        <span class="truncate max-w-md font-medium text-gray-700 group-hover:text-blue-600 transition">[[ file.name ]]</span>
+                                        <span v-if="isVideo(file.name)" class="relative mr-3 w-10 h-10 rounded-lg overflow-hidden bg-slate-100 flex-shrink-0 block">
+                                            <video muted preload="metadata" playsinline :src="'/api/file?path=' + encodeURIComponent(file.path) + '#t=0.5'" class="w-full h-full object-cover pointer-events-none" @error="$event.target.style.display='none'"></video>
+                                            <span class="absolute inset-0 flex items-center justify-center text-white text-[10px]" style="background:rgba(15,23,42,.35)"><i class="fa-solid fa-play"></i></span>
+                                        </span>
+                                        <img v-else-if="isImage(file.name)" :src="'/api/file?path=' + encodeURIComponent(file.path)" class="mr-3 w-10 h-10 rounded-lg object-cover bg-slate-100 flex-shrink-0" loading="lazy" alt="" onerror="this.style.display='none'">
+                                        <i v-else :class="getFileIcon(file)" class="mr-3 text-xl w-10 text-center"></i>
+                                        <span class="truncate max-w-md font-medium text-gray-700 group-hover:text-indigo-600 transition">[[ file.name ]]</span>
                                     </td>
                                     <td class="py-3 text-gray-400 text-xs font-mono">[[ file.size ]]</td>
                                     <td class="py-3 text-gray-400 text-xs font-mono">[[ file.mtime ]]</td>
@@ -409,7 +469,7 @@
 
                     <div v-else class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 2xl:grid-cols-10 gap-4 content-start">
                         <div v-for="file in filteredFiles" :key="file.path" 
-                             class="grid-card cursor-pointer relative group flex flex-col items-center p-3 h-36 justify-between select-none" 
+                             class="grid-card cursor-pointer relative group flex flex-col p-3 h-52 select-none" 
                              :class="{'selected': selectedFiles.includes(file.path)}" 
                              @click="handleFileClick(file, $event)"
                              @dblclick="handleFileDblClick(file)"
@@ -419,15 +479,22 @@
                                 <input type="checkbox" v-model="selectedFiles" :value="file.path" class="rounded text-blue-600 focus:ring-0 shadow-sm cursor-pointer" @click.stop>
                             </div>
                             
-                            <div class="flex-1 w-full flex items-center justify-center overflow-hidden mb-2 mt-1">
+                            <div class="card-preview mb-2">
+                                <i :class="getFileIcon(file)" class="file-glyph filter drop-shadow-sm transition-transform group-hover:scale-110"></i>
                                 <img v-if="isImage(file.name)" :src="'/api/file?path=' + encodeURIComponent(file.path)" 
-                                     class="h-full w-auto object-contain rounded shadow-sm max-h-[80px] pointer-events-none" 
-                                     loading="lazy"
-                                     onerror="this.style.display='none'; this.nextElementSibling.style.display='block'">
-                                <i :class="getFileIcon(file)" class="text-6xl filter drop-shadow-sm transition-transform group-hover:scale-110" :style="{display: isImage(file.name) ? 'none' : 'block'}"></i>
+                                     class="pointer-events-none" loading="lazy" alt=""
+                                     onerror="this.style.display='none'">
+                                <video v-else-if="isVideo(file.name)" muted preload="metadata" playsinline
+                                     :src="'/api/file?path=' + encodeURIComponent(file.path) + '#t=0.5'" 
+                                     class="pointer-events-none"
+                                     @error="$event.target.style.display='none'"></video>
+                                <div v-if="isVideo(file.name)" class="play-badge"><span><i class="fa-solid fa-play"></i></span></div>
+                                <span v-if="!file.is_dir" class="type-chip">[[ file.name.split('.').pop().toUpperCase() ]]</span>
+                                <span v-else class="type-chip">文件夹</span>
                             </div>
-                            <div class="text-xs text-center w-full px-1">
-                                <div class="truncate text-gray-700 font-medium group-hover:text-blue-600 transition" :title="file.name">[[ file.name ]]</div>
+                            <div class="text-xs w-full px-1">
+                                <div class="truncate text-gray-800 font-semibold group-hover:text-indigo-600 transition" :title="file.name">[[ file.name ]]</div>
+                                <div class="text-[11px] text-gray-400 truncate mt-0.5">[[ file.is_dir ? '文件夹' : (file.size + ' · ' + file.mtime) ]]</div>
                             </div>
                         </div>
                     </div>
