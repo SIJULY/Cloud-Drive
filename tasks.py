@@ -21,20 +21,19 @@ celery.conf.update(
 @celery.task(bind=True)
 def compress_files_task(self, file_paths):
     """
-    Celery 异步压缩任务
+    Celery 异步压缩任务。
+    生成的包名固定为 archive_<时间戳>.zip（app.py 的 clean_old_archives
+    和 /api/download_result 只认这个前缀，旧代码两者对不上导致清理失效）。
+    调用方 app.py 已用 safe_join 校验过路径都在 storage 内，这里不再重复校验。
     """
     if not file_paths:
         return {'status': 'Failed', 'error': 'No files selected'}
 
-    # 压缩文件通常很大，放在 /tmp 或者 storage 根目录下的临时文件夹更安全
-    # 这里为了简单，我们把它放在第一个文件的同级目录
-    # 注意：在 Docker 中，所有路径必须是容器内的绝对路径
     base_dir = os.path.dirname(file_paths[0])
     zip_filename = f"archive_{int(time.time())}.zip"
     zip_filepath = os.path.join(base_dir, zip_filename)
 
     total_files = 0
-    # 计算文件总数
     for path in file_paths:
         if os.path.isfile(path):
             total_files += 1
@@ -51,15 +50,20 @@ def compress_files_task(self, file_paths):
                     continue
 
                 if os.path.isfile(path):
+                    # 跳过打包产物本身，避免把旧 zip 打进新 zip
+                    if os.path.basename(path).startswith('archive_') and path.endswith('.zip'):
+                        continue
                     zf.write(path, arcname=os.path.basename(path))
                     processed_count += 1
                     _update_progress(self, processed_count, total_files, f"正在压缩: {os.path.basename(path)}")
-                    
+
                 elif os.path.isdir(path):
                     parent_folder = os.path.dirname(path)
                     for root, dirs, files in os.walk(path):
                         for file in files:
                             abs_path = os.path.join(root, file)
+                            if abs_path == zip_filepath:
+                                continue
                             rel_path = os.path.relpath(abs_path, parent_folder)
                             zf.write(abs_path, arcname=rel_path)
                             processed_count += 1

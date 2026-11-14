@@ -1,47 +1,69 @@
 import os
+import sys
 import urllib.request
 import time
 
-# 定义要下载的文件和本地保存路径
+# 要下载的文件和本地保存路径（templates 里引用的是这些本地路径，不再走 CDN）
 assets = [
     {
-        "url": "https://cdn.staticfile.org/vue/3.3.4/vue.global.prod.min.js",
+        "urls": [
+            "https://cdn.staticfile.org/vue/3.3.4/vue.global.prod.min.js",
+            "https://unpkg.com/vue@3.3.4/dist/vue.global.prod.js",
+        ],
         "folder": "static/js",
-        "name": "vue.js"
+        "name": "vue.js",
     },
     {
-        "url": "https://cdn.staticfile.org/tailwindcss/2.2.19/tailwind.min.css",
+        "urls": [
+            "https://cdn.staticfile.org/tailwindcss/2.2.19/tailwind.min.css",
+            "https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css",
+        ],
         "folder": "static/css",
-        "name": "tailwind.css"
+        "name": "tailwind.css",
     },
     {
-        "url": "https://cdn.staticfile.org/font-awesome/6.4.0/css/all.min.css",
+        "urls": [
+            "https://cdn.staticfile.org/font-awesome/6.4.0/css/all.min.css",
+            "https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css",
+        ],
         "folder": "static/css",
-        "name": "fontawesome.css"
-    }
+        "name": "fontawesome.css",
+    },
 ]
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 
 print("Resource Download: Start...")
 
+failed = []
 for item in assets:
-    # 创建目录
     folder_path = os.path.join(base_dir, item["folder"])
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
-
+    os.makedirs(folder_path, exist_ok=True)
     file_path = os.path.join(folder_path, item["name"])
-    
-    # 简单的重试机制
-    for i in range(3):
-        try:
-            print(f"Downloading {item['name']} (Attempt {i+1})...")
-            urllib.request.urlretrieve(item["url"], file_path)
-            print(f"✅ Saved to: {item['folder']}/{item['name']}")
+
+    ok = False
+    for url in item["urls"]:
+        for attempt in range(3):
+            try:
+                print(f"Downloading {item['name']} from {url} (Attempt {attempt + 1})...")
+                urllib.request.urlretrieve(url, file_path)
+                # 校验：空文件 / 错误页都算失败，继续试下一个源
+                if os.path.getsize(file_path) < 1024:
+                    raise ValueError(f"downloaded file too small: {os.path.getsize(file_path)} bytes")
+                print(f"Saved to: {item['folder']}/{item['name']}")
+                ok = True
+                break
+            except Exception as e:
+                print(f"Error downloading {item['name']} from {url}: {e}")
+                time.sleep(1)
+        if ok:
             break
-        except Exception as e:
-            print(f"❌ Error downloading {item['name']}: {e}")
-            time.sleep(1)
+    if not ok:
+        failed.append(item["name"])
+
+if failed:
+    # 构建时就失败，别带着缺资源的镜像上线
+    print(f"Resource Download: FAILED for {', '.join(failed)}", file=sys.stderr)
+    sys.exit(1)
 
 print("Resource Download: Completed!")

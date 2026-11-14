@@ -1,4 +1,15 @@
 # 默认配置：监听 80 端口并转发给 app 服务
+# 有域名时把 :80 改成你的域名（如 cloud.example.com），Caddy 会自动签 HTTPS；
+# 只用 IP + 端口时，install.sh 会按你输入的端口重写本文件。
 :80 {
-    reverse_proxy app:5000
+    encode gzip
+    request_body {
+        max_size 50GB
+    }
+    reverse_proxy app:5000 {
+        transport http {
+            read_timeout 300s
+            write_timeout 300s
+        }
+    }
 }
