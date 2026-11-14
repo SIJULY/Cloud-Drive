@@ -55,6 +55,18 @@
                 <img src="{{ download_url }}" class="max-h-[60vh] rounded-lg shadow-md mb-6 object-contain">
                 <h2 class="text-xl font-bold text-gray-800 mb-2">{{ filename }}</h2>
 
+            {% elif filename.lower().endswith(('.pdf')) %}
+                <div class="w-full">
+                    <div class="flex justify-center mb-4 bg-gray-100 rounded-lg p-4"><canvas id="pdfCanvas" class="max-w-full shadow-md rounded bg-white"></canvas></div>
+                    <div class="flex items-center justify-center space-x-3 mb-4 text-sm">
+                        <button id="pdfPrev" class="px-3 py-1 rounded border border-gray-200 hover:bg-gray-50">上一页</button>
+                        <span id="pdfPageInfo" class="text-gray-500"></span>
+                        <button id="pdfNext" class="px-3 py-1 rounded border border-gray-200 hover:bg-gray-50">下一页</button>
+                    </div>
+                </div>
+                <h2 class="text-xl font-bold text-gray-800 mb-2">{{ filename }}</h2>
+                <p class="text-gray-500 text-sm mb-6">在线预览中</p>
+
             {% else %}
                 <div class="file-icon">
                     {% if filename.lower().endswith(('.zip', '.rar', '.7z', '.tar', '.gz')) %}
@@ -82,6 +94,26 @@
             </p>
         </div>
     </div>
+
+    <script type="module">
+        import * as pdfjsLib from '/static/vendor/pdfjs/pdf.mjs';
+        pdfjsLib.GlobalWorkerOptions.workerSrc = '/static/vendor/pdfjs/pdf.worker.mjs';
+        const canvas = document.getElementById('pdfCanvas');
+        if (canvas) {
+            const pdf = await pdfjsLib.getDocument({ url: "{{ download_url }}" }).promise;
+            let pageNum = 1;
+            async function render() {
+                const page = await pdf.getPage(pageNum);
+                const viewport = page.getViewport({ scale: 1.2 });
+                canvas.width = viewport.width; canvas.height = viewport.height;
+                await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+                document.getElementById('pdfPageInfo').textContent = pageNum + ' / ' + pdf.numPages;
+            }
+            document.getElementById('pdfPrev').onclick = () => { if (pageNum > 1) { pageNum--; render(); } };
+            document.getElementById('pdfNext').onclick = () => { if (pageNum < pdf.numPages) { pageNum++; render(); } };
+            render();
+        }
+    </script>
 
 </body>
 </html>

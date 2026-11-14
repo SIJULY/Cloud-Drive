@@ -26,6 +26,12 @@
             <div><input type="password" id="password" placeholder="请输入密码" class="input-field" required></div>
             <button type="submit" class="btn-primary">验证登录</button>
         </form>
+        <form id="totpForm" onsubmit="handleTotp(event)" class="space-y-5" style="display:none">
+            <p class="text-sm text-gray-500">密码正确，请输入验证器 App 里的 6 位验证码</p>
+            <div><input type="text" id="totpCode" placeholder="6 位验证码" inputmode="numeric" maxlength="6" class="input-field text-center" style="letter-spacing: 0.4em" required></div>
+            <button type="submit" class="btn-primary">验证并登录</button>
+            <button type="button" onclick="backToLogin()" class="text-sm text-gray-400 hover:text-gray-600">返回重新输入密码</button>
+        </form>
         <p class="footer-text">© Powered by 小龙女她爸</p>
     </div>
     <script>
@@ -42,8 +48,25 @@
                     body: JSON.stringify({ username, password })
                 });
                 const data = await res.json();
-                if (res.ok && data.status === 'success') { window.location.href = '/'; } 
+                if (res.ok && data.status === 'success') { window.location.href = '/'; }
+                else if (res.ok && data.status === 'need_totp') { document.getElementById('loginForm').style.display = 'none'; document.getElementById('totpForm').style.display = 'block'; document.getElementById('totpCode').focus(); }
                 else { alert(data.message || '登录失败'); btn.innerText = originalText; btn.disabled = false; }
+            } catch (err) { alert('网络错误'); btn.innerText = originalText; btn.disabled = false; }
+        }
+        function backToLogin() { document.getElementById('totpForm').style.display = 'none'; document.getElementById('loginForm').style.display = 'block'; }
+        async function handleTotp(e) {
+            e.preventDefault();
+            const btn = document.querySelector('#totpForm button[type="submit"]');
+            const originalText = btn.innerText;
+            btn.innerText = '验证中...'; btn.disabled = true;
+            try {
+                const res = await fetch('/api/login/totp', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ code: document.getElementById('totpCode').value })
+                });
+                const data = await res.json();
+                if (res.ok && data.status === 'success') { window.location.href = '/'; }
+                else { alert(data.message || '验证码错误'); btn.innerText = originalText; btn.disabled = false; }
             } catch (err) { alert('网络错误'); btn.innerText = originalText; btn.disabled = false; }
         }
     </script>
