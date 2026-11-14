@@ -1065,7 +1065,7 @@ def _hls_transcode(rel, hid):
                 ['ffmpeg', '-y', '-i', abs_path,
                  '-vf', 'scale=-2:720', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
                  '-c:a', 'aac', '-b:a', '128k',
-                 '-hls_time', '6', '-hls_playlist_type', 'vod',
+                 '-hls_time', '6', '-hls_list_size', '0',
                  '-hls_segment_filename', os.path.join(outdir, 'seg%03d.ts'),
                  os.path.join(outdir, 'playlist.m3u8')],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=86400)

@@ -1141,24 +1141,27 @@
                 async attachHls(hid, direct) {
                     await this.$nextTick();
                     const playlist = `/api/hls/${hid}/playlist.m3u8`;
+                    let ok = false;
                     for (let i = 0; i < 40; i++) {
                         const head = await fetch(playlist, { method: 'GET' });
-                        if (head.ok) break;
+                        if (head.ok) { ok = true; break; }
                         if (head.status !== 202) { this.videoPlayer.url = direct; return; }
                         await new Promise(r => setTimeout(r, 3000));
                         if (!this.videoPlayer.show) return;
                     }
                     if (!this.videoPlayer.show) return;
+                    if (!ok) { this.videoPlayer.url = direct; return; }
                     const video = this.$refs.videoEl;
                     if (window.Hls && window.Hls.isSupported()) {
                         if (this._hls) this._hls.destroy();
-                        const hls = new window.Hls();
+                        const hls = new window.Hls({ startPosition: 0 });
                         hls.loadSource(playlist);
                         hls.attachMedia(video);
                         this._hls = hls;
                         this.videoPlayer.status = '';
                     } else if (video && video.canPlayType('application/vnd.apple.mpegurl')) {
                         video.src = playlist;
+                        video.addEventListener('loadedmetadata', function goStart() { video.currentTime = 0; video.removeEventListener('loadedmetadata', goStart); });
                         this.videoPlayer.status = '';
                     } else {
                         this.videoPlayer.url = direct;
