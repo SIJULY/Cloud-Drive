@@ -1,0 +1,9 @@
+.git
+data/
+storage/
+trash/
+shares/
+.env
+__pycache__
+*.pyc
+.venv

@@ -95,13 +95,15 @@ python app.py
 gunicorn -w 4 -b 0.0.0.0:5000 app:app
 ```
 
-### 5. 账号配置
+### 5. 账号配置（必须改，绝不用默认密码上线）
 
-* export ADMIN_USER="admin"
+```bash
+cp .env.example .env
+# 编辑 .env：ADMIN_PASS 改成随机强密码，SECRET_KEY 用 openssl rand -hex 32 生成
+# SHARE_EXPIRE_DAYS=30：分享默认 30 天过期，0 = 永不过期
+```
 
-* export ADMIN_PASS="your_secure_password"
-
-* export SECRET_KEY="your_random_secret_key"
+一键安装脚本会替你生成随机密码和 SECRET_KEY，写进 `/opt/my-cloud-drive/.env`（权限 600）。
 
 ### 📖 使用说明
 
@@ -118,6 +120,12 @@ gunicorn -w 4 -b 0.0.0.0:5000 app:app
 * 分享: 选中文件 -> 点击“分享” -> 复制链接发给朋友。
 
 * 播放: 双击视频文件即可在线观看。
+
+### 🔒 安全说明（2026-11-14 修订版已修复）
+* 所有用户传来的路径都经过校验，`..`、绝对路径、符号链接穿越都会被拦；`/api/download_result` 只允许下载 storage 内的 `archive_*.zip`。
+* 分享 ID 从 6 位 hex 加到 12 位，默认 30 天过期（`SHARE_EXPIRE_DAYS` 可改），过期链接返回 404。
+* 未配 `SECRET_KEY` 时每次启动生成临时密钥并警告；登录连续 5 次失败锁 IP 5 分钟；上传上限 50GB，文件名经过清洗。
+* 元数据 JSON 用锁 + 原子写，Gunicorn 多进程并发写不再丢数据。
 
 ### 📝 注意事项
 * 视频格式: 在线播放依赖浏览器解码能力，支持 MP4 (H.264), WebM, Ogg。MKV/AVI 等格式建议下载后观看。

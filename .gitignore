@@ -1,0 +1,12 @@
+# 运行数据与凭据，绝不进仓库
+.env
+data/
+storage/
+trash/
+shares/
+*.tmp.*
+__pycache__/
+*.pyc
+static/
+.venv/
+venv/
