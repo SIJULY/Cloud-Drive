@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} - 文件收集</title>
+    <link href="/static/css/tailwind.css" rel="stylesheet">
+    <link href="/static/css/fontawesome.css" rel="stylesheet">
+    <style>
+        body { background-color: #f3f4f6; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; font-family: sans-serif; }
+        .card { background: white; border-radius: 16px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04); width: 90%; max-width: 640px; overflow: hidden; }
+        .header { background: linear-gradient(135deg, #059669, #0d9488); padding: 20px; color: white; display: flex; align-items: center; justify-content: space-between; }
+        .content { padding: 30px; display: flex; flex-direction: column; align-items: center; }
+        .btn { padding: 12px 30px; border-radius: 99px; font-weight: 600; transition: all 0.2s; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; }
+        .btn-primary { background: linear-gradient(135deg, #059669, #0d9488); color: white; box-shadow: 0 6px 16px rgba(5,150,105,.35); }
+        .btn-primary:hover { filter: brightness(1.08); }
+        .dropzone { width: 100%; border: 2px dashed #a7f3d0; border-radius: 12px; padding: 36px 16px; text-align: center; color: #6b7280; cursor: pointer; transition: all 0.2s; }
+        .dropzone:hover, .dropzone.over { border-color: #059669; background: #ecfdf5; }
+        .progress { width: 100%; height: 8px; background: #e5e7eb; border-radius: 99px; overflow: hidden; margin-top: 8px; }
+        .progress > div { height: 100%; background: linear-gradient(135deg, #059669, #0d9488); width: 0%; transition: width 0.2s; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="header">
+            <div class="flex items-center">
+                <i class="fa-solid fa-cloud-arrow-up text-2xl mr-3"></i>
+                <span class="font-bold text-lg">文件收集</span>
+            </div>
+            <div class="text-sm opacity-80">Pro Max</div>
+        </div>
+
+        <div class="content">
+            {% if need_password %}
+                <div style="font-size: 80px; color: #60a5fa; margin-bottom: 20px"><i class="fa-solid fa-lock text-emerald-500"></i></div>
+                <h2 class="text-xl font-bold text-gray-800 mb-2">{{ title }}</h2>
+                <p class="text-gray-500 text-sm mb-6">该收集链接设置了提取码，请输入后上传</p>
+                {% if pw_error %}<p class="text-red-500 text-sm mb-4">{{ pw_error }}</p>{% endif %}
+                <form method="post" class="flex flex-col items-center w-full max-w-xs">
+                    <input type="password" name="password" placeholder="请输入提取码" autofocus
+                           class="w-full px-4 py-3 border border-gray-300 rounded-full mb-4 text-center outline-none focus:border-emerald-500">
+                    <button type="submit" class="btn btn-primary"><i class="fa-solid fa-key mr-2"></i> 验证并进入</button>
+                </form>
+            {% else %}
+                <h2 class="text-xl font-bold text-gray-800 mb-1">{{ title }}</h2>
+                <p class="text-gray-500 text-sm mb-6">上传到「{{ folder_name }}」{% if max_files %} · 最多 {{ max_files }} 个文件（已传 {{ uploads }} 个）{% endif %} · 上传后只有对方能看到</p>
+
+                <div id="dropzone" class="dropzone" onclick="document.getElementById('fileInput').click()">
+                    <i class="fa-solid fa-cloud-arrow-up text-4xl text-emerald-500 mb-3"></i>
+                    <p class="font-medium">点这里选择文件，或把文件拖进来</p>
+                    <p class="text-xs mt-1">支持多选，单个文件最大 50GB</p>
+                </div>
+                <input id="fileInput" type="file" multiple style="display:none" onchange="uploadFiles(this.files)">
+
+                <div id="queue" class="w-full mt-4"></div>
+
+                <p class="mt-6 text-xs text-gray-400 text-center">
+                    <i class="fa-solid fa-shield-halved mr-1"></i> 文件仅上传到对方网盘，不会公开
+                </p>
+            {% endif %}
+        </div>
+    </div>
+
+    <script>
+        const dropId = "{{ drop_id }}";
+        const dz = document.getElementById('dropzone');
+        if (dz) {
+            ['dragover', 'dragenter'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add('over'); }));
+            ['dragleave', 'drop'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove('over'); }));
+            dz.addEventListener('drop', e => uploadFiles(e.dataTransfer.files));
+        }
+        function uploadFiles(files) {
+            const queue = document.getElementById('queue');
+            for (const file of files) {
+                const row = document.createElement('div');
+                row.className = 'mb-3';
+                row.innerHTML = '<div class="flex justify-between text-sm"><span class="truncate text-gray-700">' + escapeHtml(file.name) + '</span><span class="status text-gray-400 whitespace-nowrap ml-2">等待上传</span></div><div class="progress"><div></div></div>';
+                queue.appendChild(row);
+                const bar = row.querySelector('.progress > div');
+                const status = row.querySelector('.status');
+                const form = new FormData();
+                form.append('file', file);
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', '/d/' + dropId + '/upload', true);
+                xhr.upload.onprogress = e => { if (e.lengthComputable) bar.style.width = (e.loaded / e.total * 100) + '%'; };
+                xhr.onload = () => {
+                    if (xhr.status === 200) { bar.style.width = '100%'; status.textContent = '✓ 已上传'; status.className = 'status text-emerald-600 whitespace-nowrap ml-2'; }
+                    else { status.textContent = '上传失败：' + (JSON.parse(xhr.responseText || '{}').error || xhr.status); status.className = 'status text-red-500 whitespace-nowrap ml-2'; }
+                };
+                xhr.onerror = () => { status.textContent = '网络错误'; status.className = 'status text-red-500 whitespace-nowrap ml-2'; };
+                xhr.send(form);
+            }
+        }
+        function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    </script>
+</body>
+</html>

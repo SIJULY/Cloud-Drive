@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ folder_name }} - 文件夹分享</title>
+    <link href="/static/css/tailwind.css" rel="stylesheet">
+    <link href="/static/css/fontawesome.css" rel="stylesheet">
+    <style>
+        body { background-color: #f3f4f6; display: flex; align-items: flex-start; justify-content: center; min-height: 100vh; margin: 0; font-family: sans-serif; padding: 24px 0; }
+        .card { background: white; border-radius: 16px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04); width: 94%; max-width: 800px; overflow: hidden; }
+        .header { background: linear-gradient(135deg, #4f46e5, #7c3aed); padding: 20px; color: white; display: flex; align-items: center; justify-content: space-between; }
+        .content { padding: 24px 30px 30px; }
+        .btn { padding: 10px 24px; border-radius: 99px; font-weight: 600; transition: all 0.2s; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; }
+        .btn-primary { background: linear-gradient(135deg, #4f46e5, #7c3aed); color: white; box-shadow: 0 6px 16px rgba(79,70,229,.35); }
+        .btn-primary:hover { filter: brightness(1.08); }
+        .row { display: flex; align-items: center; padding: 10px 8px; border-bottom: 1px solid #f3f4f6; }
+        .row:hover { background: #f9fafb; }
+        .row a { color: #1f2937; text-decoration: none; }
+        .row a:hover { color: #4f46e5; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="header">
+            <div class="flex items-center">
+                <i class="fa-solid fa-cloud text-2xl mr-3"></i>
+                <span class="font-bold text-lg">我的云盘分享</span>
+            </div>
+            <div class="text-sm opacity-80">Pro Max</div>
+        </div>
+
+        <div class="content">
+            <div class="flex items-center justify-between mb-4">
+                <div class="flex items-center text-gray-700 min-w-0">
+                    <i class="fa-solid fa-folder-open text-indigo-500 text-xl mr-2"></i>
+                    <span class="font-bold truncate">{{ folder_name }}</span>
+                    {% if subpath %}<span class="text-gray-400 ml-2 truncate">/ {{ subpath }}</span>{% endif %}
+                </div>
+                {% if entries %}
+                <a href="/s/{{ share_id }}/zip" class="btn btn-primary text-sm"><i class="fa-solid fa-file-zipper mr-2"></i> 打包下载全部</a>
+                {% endif %}
+            </div>
+
+            {% if parent is not none %}
+            <div class="row"><a href="/s/{{ share_id }}{% if parent %}?path={{ parent }}{% endif %}"><i class="fa-solid fa-arrow-turn-up text-gray-400 mr-3"></i> 返回上一级</a></div>
+            {% endif %}
+
+            {% if not entries %}
+            <p class="text-gray-400 text-sm text-center py-8">这个文件夹是空的</p>
+            {% endif %}
+
+            {% for e in entries %}
+            <div class="row">
+                {% if e.is_dir %}
+                <i class="fa-solid fa-folder text-yellow-400 mr-3"></i>
+                <a href="/s/{{ share_id }}?path={{ e.rel }}" class="flex-1 truncate font-medium">{{ e.name }}</a>
+                {% else %}
+                <i class="fa-solid fa-file text-gray-400 mr-3"></i>
+                <a href="/s/{{ share_id }}/f/{{ e.rel }}" class="flex-1 truncate">{{ e.name }}</a>
+                {% endif %}
+                <span class="text-xs text-gray-400 w-20 text-right hidden sm:block">{{ e.size }}</span>
+                <span class="text-xs text-gray-400 w-32 text-right hidden sm:block">{{ e.mtime }}</span>
+                {% if not e.is_dir %}
+                <a href="/s/{{ share_id }}/f/{{ e.rel }}?dl=1" class="ml-4 text-indigo-500 hover:text-indigo-700 text-sm whitespace-nowrap"><i class="fa-solid fa-download"></i> 下载</a>
+                {% endif %}
+            </div>
+            {% endfor %}
+
+            <p class="mt-6 text-xs text-gray-400 text-center">
+                <i class="fa-solid fa-shield-halved mr-1"></i> 安全传输 | 支持 IDM / 迅雷 / 浏览器原生下载
+            </p>
+        </div>
+    </div>
+</body>
+</html>

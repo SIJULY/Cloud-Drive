@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import base64
 import io
+import zipfile
 import shutil
 import json
 import time
@@ -12,7 +13,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta
 from functools import wraps
-from flask import Flask, render_template, jsonify, request, send_file, redirect, session, url_for
+from flask import Flask, render_template, jsonify, request, send_file, redirect, session, url_for, after_this_request
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -358,6 +359,47 @@ def _hash_share_password(password, salt_hex):
                                bytes.fromhex(salt_hex), _PW_ITERS).hex()
 
 
+def _check_record_password(rec, password):
+    """通用提取码校验：rec 须有 pw_hash/pw_salt/pw_fails/pw_locked_until 字段。
+    返回 'ok' / 'wrong' / 'locked' / 'public'（无提取码），并原地更新失败计数
+    （调用方负责保存）。连续错 5 次锁定 5 分钟。"""
+    if not rec.get('pw_hash'):
+        return 'public'
+    locked_until = rec.get('pw_locked_until')
+    if locked_until:
+        try:
+            if datetime.now() < datetime.fromisoformat(locked_until):
+                return 'locked'
+        except ValueError:
+            pass
+    ok = hmac.compare_digest(
+        rec['pw_hash'],
+        _hash_share_password(password or '', rec.get('pw_salt') or ''))
+    if ok:
+        rec['pw_fails'] = 0
+        rec['pw_locked_until'] = None
+        return 'ok'
+    fails = rec.get('pw_fails', 0) + 1
+    rec['pw_fails'] = fails
+    if fails >= _PW_MAX_FAILS:
+        rec['pw_fails'] = 0
+        rec['pw_locked_until'] = (datetime.now() + timedelta(seconds=_PW_LOCK_SECONDS)).isoformat(timespec='seconds')
+        return 'locked'
+    return 'wrong'
+
+
+def _set_record_password(rec, password):
+    """给一条分享/收集记录设提取码：''/None=清除，字符串=设新码。"""
+    if not password:
+        rec['pw_salt'] = None
+        rec['pw_hash'] = None
+    else:
+        rec['pw_salt'] = secrets.token_hex(8)
+        rec['pw_hash'] = _hash_share_password(str(password), rec['pw_salt'])
+    rec['pw_fails'] = 0
+    rec['pw_locked_until'] = None
+
+
 class ShareManager(JsonManager):
     def create_share(self, rel_path, password=None, max_downloads=None, expires_days=None):
         with self._lock:
@@ -425,29 +467,9 @@ class ShareManager(JsonManager):
                 return 'wrong'
             if not rec.get('pw_hash'):
                 return 'public'
-            locked_until = rec.get('pw_locked_until')
-            if locked_until:
-                try:
-                    if datetime.now() < datetime.fromisoformat(locked_until):
-                        return 'locked'
-                except ValueError:
-                    pass
-            ok = hmac.compare_digest(
-                rec['pw_hash'],
-                _hash_share_password(password or '', rec.get('pw_salt') or ''))
-            locked_now = False
-            if ok:
-                rec['pw_fails'] = 0
-                rec['pw_locked_until'] = None
-            else:
-                fails = rec.get('pw_fails', 0) + 1
-                rec['pw_fails'] = fails
-                if fails >= _PW_MAX_FAILS:
-                    rec['pw_fails'] = 0
-                    rec['pw_locked_until'] = (datetime.now() + timedelta(seconds=_PW_LOCK_SECONDS)).isoformat(timespec='seconds')
-                    locked_now = True
+            res = _check_record_password(rec, password)
             self.save_metadata()
-            return 'ok' if ok else ('locked' if locked_now else 'wrong')
+            return res
 
     @staticmethod
     def is_exhausted(info):
@@ -483,6 +505,8 @@ class ShareManager(JsonManager):
                             'downloads': info.get('downloads', 0),
                             'max_downloads': info.get('max_downloads'),
                             'has_password': bool(info.get('pw_hash')),
+                            'is_dir': bool(info.get('is_dir')),
+                            'kind': 'share',
                             'status': status})
             return sorted(res, key=lambda x: x['mtime'], reverse=True)
 
@@ -509,8 +533,104 @@ class ShareManager(JsonManager):
                 self.data[share_id]['downloads'] = self.data[share_id].get('downloads', 0) + 1
                 self.save_metadata()
 
+DROP_META_FILE = os.path.join(SHARE_DIR, 'drop_metadata.json')
+
+
+class DropManager(JsonManager):
+    """File Drop（收集链接）：访客无需登录，只能往指定文件夹里传文件，看不到已有内容。"""
+
+    def create_drop(self, folder_path, title=None, password=None, max_files=None, expires_days=None):
+        with self._lock:
+            self.load_metadata()
+            drop_id = uuid.uuid4().hex[:12]
+            while drop_id in self.data:
+                drop_id = uuid.uuid4().hex[:12]
+            days = SHARE_EXPIRE_DAYS if expires_days is None else expires_days
+            expires_at = None
+            if days and days > 0:
+                expires_at = (datetime.now() + timedelta(days=days)).isoformat(timespec='seconds')
+            rec = {
+                'folder_path': folder_path or '',
+                'title': title or '',
+                'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'expires_at': expires_at, 'uploads': 0,
+                'max_files': max_files if (max_files and max_files > 0) else None,
+                'pw_salt': None, 'pw_hash': None, 'pw_fails': 0, 'pw_locked_until': None,
+            }
+            _set_record_password(rec, password)
+            self.data[drop_id] = rec
+            self.save_metadata()
+            return drop_id
+
+    def cancel_drop(self, drop_id):
+        with self._lock:
+            self.load_metadata()
+            if drop_id in self.data:
+                del self.data[drop_id]
+                self.save_metadata()
+                return True
+            return False
+
+    def verify_password(self, drop_id, password):
+        with self._lock:
+            self.load_metadata()
+            rec = self.data.get(drop_id)
+            if not rec:
+                return 'wrong'
+            res = _check_record_password(rec, password)
+            self.save_metadata()
+            return res
+
+    @staticmethod
+    def is_exhausted(info):
+        limit = info.get('max_files')
+        return bool(limit and limit > 0 and info.get('uploads', 0) >= limit)
+
+    def get_drop(self, drop_id):
+        with self._lock:
+            self.load_metadata()
+            info = self.data.get(drop_id)
+            if not info:
+                return None
+            if _is_expired(info):
+                del self.data[drop_id]
+                self.save_metadata()
+                return None
+            return info
+
+    def increment_uploads(self, drop_id):
+        with self._lock:
+            self.load_metadata()
+            if drop_id in self.data and not _is_expired(self.data[drop_id]) \
+                    and not self.is_exhausted(self.data[drop_id]):
+                self.data[drop_id]['uploads'] = self.data[drop_id].get('uploads', 0) + 1
+                self.save_metadata()
+
+    def get_list(self):
+        with self._lock:
+            self.load_metadata()
+            res = []
+            for did, info in self.data.items():
+                if _is_expired(info):
+                    continue
+                folder = info.get('folder_path') or ''
+                p = safe_join(ROOT_DIR, folder) if folder else ROOT_DIR
+                exists = bool(p and os.path.isdir(p))
+                status = 'exhausted' if self.is_exhausted(info) else ('normal' if exists else 'lost')
+                name = info.get('title') or ('根目录' if not folder else os.path.basename(folder.rstrip('/')))
+                res.append({'id': did, 'name': name, 'path': folder,
+                            'mtime': info['created_at'], 'expires_at': info.get('expires_at'),
+                            'downloads': info.get('uploads', 0),
+                            'max_downloads': info.get('max_files'),
+                            'has_password': bool(info.get('pw_hash')),
+                            'is_dir': True, 'kind': 'drop',
+                            'status': status})
+            return sorted(res, key=lambda x: x['mtime'], reverse=True)
+
+
 trash_manager = TrashManager(TRASH_META_FILE)
 share_manager = ShareManager(SHARE_META_FILE)
+drop_manager = DropManager(DROP_META_FILE)
 
 def human_readable_size(size):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -680,8 +800,6 @@ def public_share_link(share_id):
     abs_path = safe_join(ROOT_DIR, info['file_path'])
     if not abs_path or not os.path.exists(abs_path):
         return "源文件已被删除", 404
-    if info['is_dir']:
-        return f"这是一个文件夹 ({info['file_name']})，暂不支持下载。", 200
 
     # 提取码门禁：验证通过后在 session 里记一笔，本次浏览器内不再重复输码
     if info.get('pw_hash') and not session.get('share_auth_' + share_id):
@@ -695,6 +813,32 @@ def public_share_link(share_id):
         return render_template('share.html', filename=info['file_name'],
                                need_password=True, pw_error=err)
 
+    # 文件夹分享：列出目录内容（可进子目录），文件走 /s/<id>/f/<相对路径>
+    if info['is_dir']:
+        sub = (request.args.get('path') or '').replace('\\', '/').strip('/')
+        target = safe_join(abs_path, sub) if sub else abs_path
+        if target is None or not os.path.isdir(target):
+            return "文件夹不存在", 404
+        entries = []
+        try:
+            with os.scandir(target) as it:
+                for entry in it:
+                    if entry.name.startswith(('archive_', 'batch_download_')) and entry.name.endswith('.zip'):
+                        continue
+                    st = entry.stat()
+                    rel = (sub + '/' + entry.name).strip('/') if sub else entry.name
+                    entries.append({'name': entry.name, 'is_dir': entry.is_dir(),
+                                    'size': human_readable_size(st.st_size) if not entry.is_dir() else '-',
+                                    'mtime': time.strftime('%Y-%m-%d %H:%M', time.localtime(st.st_mtime)),
+                                    'rel': rel})
+        except OSError:
+            pass
+        entries.sort(key=lambda x: (not x['is_dir'], x['name']))
+        parent = '/'.join(sub.split('/')[:-1]) if sub else None
+        return render_template('share_folder.html', share_id=share_id,
+                               folder_name=info['file_name'], subpath=sub, parent=parent,
+                               entries=entries)
+
     if request.args.get('dl') == '1':
         share_manager.increment_download(share_id)
         # conditional=True：支持 Range 分段请求（视频拖进度、多线程下载的前提）
@@ -705,6 +849,97 @@ def public_share_link(share_id):
 
     download_url = url_for('public_share_link', share_id=share_id, dl='1')
     return render_template('share.html', filename=info['file_name'], download_url=download_url)
+
+
+def _share_gate(share_id):
+    """文件夹内文件/打包下载的公共门禁：返回 (info, abs_path) 或 (None, 错误文本, 状态码)。"""
+    raw = share_manager.get_raw(share_id)
+    if raw and ShareManager.is_exhausted(raw):
+        return None, ("该分享已达下载次数上限", 404)
+    info = share_manager.get_file_info(share_id)
+    if not info:
+        return None, ("分享链接已过期或不存在", 404)
+    abs_path = safe_join(ROOT_DIR, info['file_path'])
+    if not abs_path or not os.path.exists(abs_path):
+        return None, ("源文件已被删除", 404)
+    if info.get('pw_hash') and not session.get('share_auth_' + share_id):
+        return None, ("需要提取码", 403)
+    return (info, abs_path), None
+
+
+@app.route('/s/<share_id>/f/<path:rel>')
+def public_share_file(share_id, rel):
+    if not re.fullmatch(r'[0-9a-f]{6,12}', share_id or ''):
+        return "分享链接已过期或不存在", 404
+    gated, err = _share_gate(share_id)
+    if err:
+        # 未输码的访客回到分享主页去输码，其他错误直接提示
+        if err[1] == 403:
+            return redirect(url_for('public_share_link', share_id=share_id))
+        return err[0], err[1]
+    info, folder_abs = gated
+    if not info['is_dir']:
+        return "分享链接已过期或不存在", 404
+    target = safe_join(folder_abs, rel.replace('\\', '/'))
+    if target is None or not os.path.exists(target):
+        return "文件不存在", 404
+    if os.path.isdir(target):
+        return redirect(url_for('public_share_link', share_id=share_id, path=rel.replace('\\', '/')))
+    if request.args.get('dl') == '1':
+        share_manager.increment_download(share_id)
+        response = send_file(target, as_attachment=False, download_name=os.path.basename(target),
+                             conditional=True)
+        response.headers["Accept-Ranges"] = "bytes"
+        return response
+    filename = os.path.basename(target)
+    download_url = url_for('public_share_file', share_id=share_id, rel=rel.replace('\\', '/'), dl='1')
+    return render_template('share.html', filename=filename, download_url=download_url)
+
+
+@app.route('/s/<share_id>/zip')
+def public_share_zip(share_id):
+    """文件夹分享一键打包：整目录打成一个 zip 下载（记 1 次下载，5GB 上限防刷爆磁盘）。"""
+    if not re.fullmatch(r'[0-9a-f]{6,12}', share_id or ''):
+        return "分享链接已过期或不存在", 404
+    gated, err = _share_gate(share_id)
+    if err:
+        if err[1] == 403:
+            return redirect(url_for('public_share_link', share_id=share_id))
+        return err[0], err[1]
+    info, folder_abs = gated
+    if not info['is_dir']:
+        return "分享链接已过期或不存在", 404
+    total = 0
+    for root, _dirs, files in os.walk(folder_abs):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+            if total > 5 * 1024 * 1024 * 1024:
+                return "文件夹超过 5GB，请分批下载", 400
+    zip_name = f"share_{share_id}_{int(time.time())}.zip"
+    zip_path = os.path.join(UPLOAD_TMP_DIR, zip_name)
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for root, _dirs, files in os.walk(folder_abs):
+            for name in files:
+                full = os.path.join(root, name)
+                arc = os.path.relpath(full, folder_abs)
+                try:
+                    zf.write(full, arc)
+                except OSError:
+                    pass
+
+    @after_this_request
+    def _cleanup(response):
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        return response
+
+    share_manager.increment_download(share_id)
+    return send_file(zip_path, as_attachment=True, download_name=f"{info['file_name']}.zip")
 
 
 # --- 图床专用接口 ---
@@ -725,6 +960,65 @@ def image_hosting(share_id, ext=None):
     response = send_file(abs_path, as_attachment=False, conditional=True)
     response.headers["Accept-Ranges"] = "bytes"
     return response
+
+# --- File Drop（收集链接）：访客免登录上传，目标文件夹内容不对外展示 ---
+@app.route('/d/<drop_id>', methods=['GET', 'POST'])
+def public_drop(drop_id):
+    if not re.fullmatch(r'[0-9a-f]{6,12}', drop_id or ''):
+        return "收集链接已过期或不存在", 404
+    info = drop_manager.get_drop(drop_id)
+    if not info:
+        return "收集链接已过期或不存在", 404
+    if DropManager.is_exhausted(info):
+        return "该收集链接已达文件数量上限", 404
+    if info.get('pw_hash') and not session.get('drop_auth_' + drop_id):
+        err = None
+        if request.method == 'POST':
+            res = drop_manager.verify_password(drop_id, request.form.get('password', ''))
+            if res in ('ok', 'public'):
+                session['drop_auth_' + drop_id] = True
+                return redirect(url_for('public_drop', drop_id=drop_id))
+            err = '提取码错太多次，已锁定 5 分钟，请稍后再试' if res == 'locked' else '提取码错误'
+        return render_template('drop.html', title=info.get('title') or '文件收集',
+                               need_password=True, pw_error=err)
+    folder = info.get('folder_path') or ''
+    return render_template('drop.html', title=info.get('title') or '文件收集',
+                           folder_name='根目录' if not folder else os.path.basename(folder.rstrip('/')),
+                           drop_id=drop_id, max_files=info.get('max_files'),
+                           uploads=info.get('uploads', 0))
+
+
+@app.route('/d/<drop_id>/upload', methods=['POST'])
+def public_drop_upload(drop_id):
+    if not re.fullmatch(r'[0-9a-f]{6,12}', drop_id or ''):
+        return jsonify({'error': 'Not found'}), 404
+    info = drop_manager.get_drop(drop_id)
+    if not info:
+        return jsonify({'error': '收集链接已过期或不存在'}), 404
+    if DropManager.is_exhausted(info):
+        return jsonify({'error': '已达文件数量上限'}), 400
+    if info.get('pw_hash') and not session.get('drop_auth_' + drop_id):
+        return jsonify({'error': '需要提取码'}), 403
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file'}), 400
+    file = request.files['file']
+    filename = safe_name(file.filename)
+    if not filename:
+        return jsonify({'error': 'Invalid filename'}), 400
+    folder = info.get('folder_path') or ''
+    dest_dir = safe_join(ROOT_DIR, folder) if folder else ROOT_DIR
+    if dest_dir is None or not os.path.isdir(dest_dir):
+        return jsonify({'error': '目标文件夹不存在'}), 404
+    # 重名自动加 (1)、(2)，不覆盖已有文件
+    base, ext = os.path.splitext(filename)
+    final, n = filename, 1
+    while os.path.exists(os.path.join(dest_dir, final)):
+        n += 1
+        final = f"{base} ({n}){ext}"
+    file.save(os.path.join(dest_dir, final))
+    drop_manager.increment_uploads(drop_id)
+    return jsonify({'status': 'success', 'name': final})
+
 
 # --- 受保护的 API ---
 
@@ -892,6 +1186,39 @@ def list_shares():
 @auth_required
 def cancel_share_link():
     share_manager.cancel_share(get_json().get('id'))
+    return jsonify({'status': 'success'})
+
+
+@app.route('/api/drop/create', methods=['POST'])
+@auth_required
+def create_drop_link():
+    data = get_json()
+    folder = (data.get('folder') or '').replace('\\', '/').strip('/')
+    dest = safe_join(ROOT_DIR, folder) if folder else ROOT_DIR
+    if dest is None or not os.path.isdir(dest):
+        return jsonify({'error': '目标文件夹不存在'}), 404
+    title = str(data.get('title') or '')[:64]
+    password = data.get('password')
+    if password is not None:
+        password = str(password)[:64] or None
+    max_files = _parse_opt_int(data.get('max_files'))
+    exp_days = _parse_opt_int(data.get('expires_days'))
+    drop_id = drop_manager.create_drop(folder, title=title, password=password,
+                                       max_files=max_files, expires_days=exp_days)
+    return jsonify({'status': 'success', 'id': drop_id,
+                    'link': f"{request.host_url}d/{drop_id}"})
+
+
+@app.route('/api/drop/list', methods=['GET'])
+@auth_required
+def list_drops():
+    return jsonify(drop_manager.get_list())
+
+
+@app.route('/api/drop/cancel', methods=['POST'])
+@auth_required
+def cancel_drop_link():
+    drop_manager.cancel_drop(get_json().get('id'))
     return jsonify({'status': 'success'})
 
 @app.route('/api/delete', methods=['POST'])
