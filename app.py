@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, render_template, jsonify, request, send_file, redirect, session, url_for, after_this_request
 from werkzeug.utils import secure_filename
+from PIL import Image, ImageOps
 
 app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
@@ -55,6 +56,75 @@ except ValueError:
 for d in [ROOT_DIR, TRASH_DIR, SHARE_DIR]:
     if not os.path.exists(d):
         os.makedirs(d)
+
+# --- 缩略图 + 照片时间线 ---
+THUMB_DIR = os.path.join(SHARE_DIR, 'thumbs')
+THUMB_SIZE = (320, 320)
+THUMB_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
+PHOTO_INDEX_FILE = os.path.join(SHARE_DIR, 'photo_index.json')
+_PHOTO_INDEX = {}
+_PHOTO_INDEX_LOADED = False
+_PHOTO_LOCK = threading.Lock()
+
+
+def _thumb_key(rel_path, mtime, size):
+    return hashlib.sha1(f'{rel_path}|{mtime}|{size}'.encode()).hexdigest()
+
+
+def _prune_thumbs(max_files=3000, keep=2500):
+    """缩略图缓存超过上限时删最旧的，防止无限增长。"""
+    try:
+        names = [os.path.join(THUMB_DIR, n) for n in os.listdir(THUMB_DIR)]
+        files = sorted((f for f in names if os.path.isfile(f)), key=os.path.getmtime)
+        if len(files) > max_files:
+            for f in files[:len(files) - keep]:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def _photo_date(abs_path):
+    """读 EXIF 拍摄日期（DateTimeOriginal 优先），没有则返回 None（调用方用文件 mtime）。"""
+    try:
+        with Image.open(abs_path) as im:
+            exif = im.getexif()
+            raw = exif.get(36867) or exif.get(36868) or exif.get(306)
+            if raw:
+                date_part = str(raw).split(' ')[0].replace(':', '-')
+                if re.fullmatch(r'\d{4}-\d{2}-\d{2}', date_part):
+                    return date_part
+    except Exception:
+        pass
+    return None
+
+
+def _load_photo_index():
+    global _PHOTO_INDEX, _PHOTO_INDEX_LOADED
+    if _PHOTO_INDEX_LOADED:
+        return
+    _PHOTO_INDEX_LOADED = True
+    try:
+        if os.path.isfile(PHOTO_INDEX_FILE):
+            with open(PHOTO_INDEX_FILE, 'r', encoding='utf-8') as f:
+                _PHOTO_INDEX = json.load(f) or {}
+    except Exception:
+        _PHOTO_INDEX = {}
+
+
+def _save_photo_index():
+    tmp = PHOTO_INDEX_FILE + f'.tmp.{os.getpid()}'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(_PHOTO_INDEX, f)
+        os.replace(tmp, PHOTO_INDEX_FILE)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 # --- 分片上传：断点续传临时目录（在 storage 之外，不会出现在文件列表里）---
 UPLOAD_TMP_DIR = os.path.join(BASE_DIR, '.upload_tmp')
@@ -1043,6 +1113,82 @@ def list_files():
     except OSError:
         pass
     return jsonify({'files': sorted(files, key=lambda x: (not x['is_dir'], x['name'])), 'usage': get_disk_usage()})
+
+@app.route('/api/thumb')
+@auth_required
+def thumb():
+    """图片缩略图（懒加载）：服务端用 Pillow 生成 320px 以内 JPEG，按路径+mtime+大小缓存；
+    生成失败回退原图；缓存超 3000 张时删最旧的。"""
+    rel = (request.args.get('path') or '').replace('\\', '/')
+    abs_path = safe_join(ROOT_DIR, rel)
+    if not abs_path or not os.path.isfile(abs_path):
+        return jsonify({'error': 'Not found'}), 404
+    if os.path.splitext(abs_path)[1].lower() not in THUMB_EXTS:
+        return jsonify({'error': 'Not an image'}), 404
+    st = os.stat(abs_path)
+    out = os.path.join(THUMB_DIR, _thumb_key(rel, int(st.st_mtime), st.st_size) + '.jpg')
+    if not os.path.isfile(out):
+        os.makedirs(THUMB_DIR, exist_ok=True)
+        try:
+            with Image.open(abs_path) as im:
+                im = ImageOps.exif_transpose(im)  # 按 EXIF 方向摆正（手机照片常横着存）
+                im.thumbnail(THUMB_SIZE, Image.LANCZOS)
+                if im.mode in ('RGBA', 'LA', 'P'):
+                    if im.mode == 'P':
+                        im = im.convert('RGBA')
+                    bg = Image.new('RGB', im.size, (255, 255, 255))
+                    bg.paste(im, mask=im.split()[-1] if im.mode in ('RGBA', 'LA') else None)
+                    im = bg
+                elif im.mode != 'RGB':
+                    im = im.convert('RGB')
+                im.save(out, 'JPEG', quality=82)
+            _prune_thumbs()
+        except Exception:
+            return send_file(abs_path, conditional=True)
+    resp = send_file(out, mimetype='image/jpeg', conditional=True)
+    resp.headers['Cache-Control'] = 'public, max-age=86400'
+    return resp
+
+
+@app.route('/api/photos/timeline')
+@auth_required
+def photo_timeline():
+    """照片时间线：按 EXIF 拍摄日期（没有则用文件修改时间）按月分组。
+    索引存 data/shares/photo_index.json，只对新增/改动过的文件重读 EXIF。"""
+    with _PHOTO_LOCK:
+        _load_photo_index()
+        current = {}
+        for root, _dirs, files in os.walk(ROOT_DIR):
+            for name in files:
+                if os.path.splitext(name)[1].lower() not in THUMB_EXTS:
+                    continue
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, ROOT_DIR).replace('\\', '/')
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                old = _PHOTO_INDEX.get(rel)
+                if old and old.get('mtime') == int(st.st_mtime) and old.get('size') == st.st_size:
+                    current[rel] = old
+                else:
+                    date = _photo_date(full) or time.strftime('%Y-%m-%d', time.localtime(st.st_mtime))
+                    current[rel] = {'date': date, 'mtime': int(st.st_mtime), 'size': st.st_size}
+        if current != _PHOTO_INDEX:
+            _PHOTO_INDEX.clear()
+            _PHOTO_INDEX.update(current)
+            _save_photo_index()
+    months = {}
+    for rel, info in current.items():
+        month = info['date'][:7]
+        months.setdefault(month, []).append(
+            {'path': rel, 'name': os.path.basename(rel), 'date': info['date']})
+    out = []
+    for month in sorted(months, reverse=True):
+        photos = sorted(months[month], key=lambda p: (p['date'], p['name']), reverse=True)
+        out.append({'month': month, 'count': len(photos), 'photos': photos})
+    return jsonify({'months': out})
+
 
 @app.route('/api/category')
 @auth_required
