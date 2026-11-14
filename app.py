@@ -3,6 +3,8 @@ import re
 import secrets
 import hashlib
 import hmac
+import base64
+import io
 import shutil
 import json
 import time
@@ -193,6 +195,53 @@ def _login_failed(ip):
 def _login_ok(ip):
     with _LOGIN_LOCK:
         _LOGIN_ATTEMPTS.pop(ip, None)
+
+
+# ================= TOTP 两步验证 =================
+# 密钥存在 shares 卷里的 totp.json（重启、重建镜像都不丢）；
+# 也可以用环境变量 TOTP_SECRET 直接定死（此时页面上改不了，删变量+重启可恢复）。
+# 丢了验证器时的救命办法：SSH 上服务器删 data/shares/totp.json 并重启容器。
+TOTP_FILE = os.path.join(SHARE_DIR, 'totp.json')
+_TOTP_ENV_SECRET = os.getenv('TOTP_SECRET', '').strip() or None
+_TOTP_LOCK = threading.Lock()
+
+
+def _totp_load():
+    if _TOTP_ENV_SECRET:
+        return {'enabled': True, 'secret': _TOTP_ENV_SECRET, 'managed_by_env': True}
+    try:
+        with open(TOTP_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _totp_save(data):
+    tmp = TOTP_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f)
+    os.replace(tmp, TOTP_FILE)
+
+
+def _totp_verify_code(secret, code):
+    import pyotp
+    try:
+        return pyotp.TOTP(secret).verify(str(code).strip(), valid_window=1)
+    except Exception:
+        return False
+
+
+def _totp_enabled():
+    cfg = _totp_load()
+    return bool(cfg.get('enabled') and cfg.get('secret'))
+
+
+def _totp_verify(code):
+    cfg = _totp_load()
+    if not cfg.get('enabled') or not cfg.get('secret'):
+        return False
+    return _totp_verify_code(cfg['secret'], code)
 
 
 @app.after_request
@@ -513,12 +562,100 @@ def login_api():
         return jsonify({'status': 'fail', 'message': '失败次数过多，请 5 分钟后再试'}), 429
     data = get_json()
     if data.get('username') == ADMIN_USER and data.get('password') == ADMIN_PASS:
+        # 开了 TOTP：密码对了也不直接放行，先走第二步验证码
+        if _totp_enabled():
+            session['pre_totp'] = True
+            session.permanent = True
+            return jsonify({'status': 'need_totp'})
         _login_ok(ip)
         session['logged_in'] = True
         session.permanent = True
         return jsonify({'status': 'success'})
     _login_failed(ip)
     return jsonify({'status': 'fail', 'message': '账号或密码错误'}), 401
+
+
+@app.route('/api/login/totp', methods=['POST'])
+def login_totp():
+    """登录第二步：密码已通过（session 里有 pre_totp），再验 6 位 TOTP 码。"""
+    ip = request.remote_addr or 'unknown'
+    if not session.get('pre_totp'):
+        return jsonify({'status': 'fail', 'message': '请先验证账号密码'}), 401
+    if _login_locked(ip):
+        return jsonify({'status': 'fail', 'message': '失败次数过多，请 5 分钟后再试'}), 429
+    if _totp_verify(get_json().get('code', '')):
+        _login_ok(ip)
+        session.pop('pre_totp', None)
+        session['logged_in'] = True
+        session.permanent = True
+        return jsonify({'status': 'success'})
+    _login_failed(ip)
+    return jsonify({'status': 'fail', 'message': '验证码错误'}), 401
+
+
+@app.route('/api/totp/status', methods=['GET'])
+@auth_required
+def totp_status():
+    cfg = _totp_load()
+    return jsonify({'enabled': bool(cfg.get('enabled')),
+                    'managed_by_env': bool(cfg.get('managed_by_env'))})
+
+
+@app.route('/api/totp/setup', methods=['POST'])
+@auth_required
+def totp_setup():
+    """生成新密钥 + 二维码（此时未启用，扫完码输一次验证码才生效）。"""
+    if _totp_load().get('managed_by_env'):
+        return jsonify({'error': 'TOTP 由环境变量 TOTP_SECRET 管理，无法在页面上改'}), 400
+    import pyotp
+    import qrcode
+    secret = pyotp.random_base32()
+    uri = pyotp.TOTP(secret).provisioning_uri(name=f'{ADMIN_USER}@cloud.sijuly.uk',
+                                              issuer_name='我的云盘 Pro')
+    img = qrcode.make(uri)
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    qr = 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+    with _TOTP_LOCK:
+        cfg = _totp_load()
+        cfg['pending_secret'] = secret
+        _totp_save(cfg)
+    return jsonify({'status': 'success', 'secret': secret, 'otpauth_url': uri, 'qr': qr})
+
+
+@app.route('/api/totp/verify-setup', methods=['POST'])
+@auth_required
+def totp_verify_setup():
+    if _totp_load().get('managed_by_env'):
+        return jsonify({'error': 'TOTP 由环境变量管理'}), 400
+    with _TOTP_LOCK:
+        cfg = _totp_load()
+        pending = cfg.get('pending_secret')
+        if not pending:
+            return jsonify({'error': '请先获取二维码'}), 400
+        if _totp_verify_code(pending, get_json().get('code', '')):
+            cfg['secret'] = pending
+            cfg['pending_secret'] = None
+            cfg['enabled'] = True
+            _totp_save(cfg)
+            return jsonify({'status': 'success'})
+        return jsonify({'error': '验证码错误'}), 401
+
+
+@app.route('/api/totp/disable', methods=['POST'])
+@auth_required
+def totp_disable():
+    if _totp_load().get('managed_by_env'):
+        return jsonify({'error': 'TOTP 由环境变量管理'}), 400
+    if not _totp_verify(get_json().get('code', '')):
+        return jsonify({'error': '验证码错误'}), 401
+    with _TOTP_LOCK:
+        cfg = _totp_load()
+        cfg['secret'] = None
+        cfg['pending_secret'] = None
+        cfg['enabled'] = False
+        _totp_save(cfg)
+    return jsonify({'status': 'success'})
 
 @app.route('/logout')
 def logout():

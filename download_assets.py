@@ -60,6 +60,26 @@ assets = [
         "name": "fa-brands-400.woff2",
         "min_size": 1024,
     },
+    # pdf.js：PDF 在线预览用。v4 只有 ESM 构建（pdf.mjs + pdf.worker.mjs），
+    # 不再提供传统的 pdf.js；worker 必须同源加载，CDN 链接不能直接用。
+    {
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67/build/pdf.mjs",
+            "https://unpkg.com/pdfjs-dist@4.2.67/build/pdf.mjs",
+        ],
+        "folder": "static/vendor/pdfjs",
+        "name": "pdf.mjs",
+        "min_size": 100000,
+    },
+    {
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67/build/pdf.worker.mjs",
+            "https://unpkg.com/pdfjs-dist@4.2.67/build/pdf.worker.mjs",
+        ],
+        "folder": "static/vendor/pdfjs",
+        "name": "pdf.worker.mjs",
+        "min_size": 100000,
+    },
 ]
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
