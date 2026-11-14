@@ -607,7 +607,9 @@
                     contextMenu: { show: false, x: 0, y: 0, targetFile: null },
                     isFetching: false, // 用于顶部微型加载条
                     videoPlayer: { show: false, url: '', name: '' },
-                    queue: [], activeCount: 0, maxConcurrency: 3 // 队列相关
+                    queue: [], activeCount: 0, maxConcurrency: 3, // 队列相关：同时传/下 3 个文件
+                    chunkSize: 5 * 1024 * 1024, // 分片上传：每片 5MB
+                    uploadThreads: 4, downloadThreads: 4, // 分片并行线程数
                 }
             },
             computed: {
@@ -728,11 +730,98 @@
                 
                 processQueue() { if (this.activeCount >= this.maxConcurrency) return; if (this.queue.length === 0) return; const nextTask = this.queue.shift(); this.activeCount++; nextTask.start(); },
 
+                // --- 断点续传：upload_id 存在 localStorage，刷新/重选同一文件可续传 ---
+                resumeKey(file) { return this.path + '|' + file.name + '|' + file.size + '|' + file.lastModified; },
+                loadResumeMap() { try { return JSON.parse(localStorage.getItem('drive_uploads_v1') || '{}'); } catch(e) { return {}; } },
+                saveResumeMap(map) { localStorage.setItem('drive_uploads_v1', JSON.stringify(map)); },
+                sleep(ms) { return new Promise(r => setTimeout(r, ms)); },
+
                 uploadOneFile(file) {
-                    const task = reactive({ name: file.name, progress: 0, status: 'pending', statusText: '排队中...', type: 'upload', startTime: null, xhr: null, lastLoaded: 0, lastTime: 0, speedText: '' });
+                    const task = reactive({ name: file.name, progress: 0, status: 'pending', statusText: '排队中...', type: 'upload', startTime: null, xhr: null, chunkXhrs: new Set(), cancelled: false, lastLoaded: 0, lastTime: 0, speedText: '' });
                     this.transferList.unshift(task);
-                    task.start = () => {
+                    task.start = async () => {
                         task.status = 'uploading'; task.statusText = '准备中...'; task.startTime = new Date().getTime(); task.lastTime = new Date().getTime();
+                        try {
+                            const r = await this.chunkedUpload(file, task);
+                            if (r === true) { task.progress = 100; task.status = 'success'; task.speedText = ''; this.completeTask(task); this.triggerRefresh(); }
+                            else if (r === false && !task.cancelled) { // 分片接口不可用时退回旧的单次上传
+                                await this.uploadSingleFile(file, task);
+                                if (task.status === 'success') { this.completeTask(task); this.triggerRefresh(); }
+                            }
+                            // r === 'abort'：已取消或合并失败，状态已在 chunkedUpload 里置好，不覆盖
+                        } catch (e) { console.error(e); if (!task.cancelled) { task.status = 'error'; task.statusText = '失败'; } }
+                        finally { this.activeCount--; this.processQueue(); }
+                    };
+                    this.queue.push(task); this.processQueue();
+                },
+
+                // 分片上传：5MB 一片，4 线程并行，每片失败重试 3 次；返回 true=已完成，false=接口不可用走回退
+                async chunkedUpload(file, task) {
+                    const totalChunks = Math.ceil(file.size / this.chunkSize);
+                    const map = this.loadResumeMap();
+                    const key = this.resumeKey(file);
+                    let initRes;
+                    try {
+                        initRes = await fetch('/api/upload/init', { method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ name: file.name, path: this.path, size: file.size, chunk_size: this.chunkSize, total_chunks: totalChunks, upload_id: map[key] || '' }) });
+                    } catch (e) { return false; }
+                    if (!initRes.ok) return false;
+                    const init = await initRes.json();
+                    const uploadId = init.upload_id;
+                    map[key] = uploadId; this.saveResumeMap(map);
+                    const uploaded = new Set(init.uploaded || []);
+                    const chunkSizeAt = (i) => Math.min(this.chunkSize, file.size - i * this.chunkSize);
+                    let uploadedBytes = 0;
+                    uploaded.forEach(i => { uploadedBytes += chunkSizeAt(i); });
+                    const inFlight = new Map(); // index -> 已传字节
+                    const updateProgress = () => {
+                        let n = uploadedBytes;
+                        inFlight.forEach(v => { n += v; });
+                        task.progress = (n / file.size) * 100;
+                        task.statusText = Math.round(task.progress) + '%' + (uploaded.size ? ` (已续传 ${uploaded.size}/${totalChunks} 片)` : '');
+                        const now = Date.now();
+                        if (now - task.lastTime >= 500) { task.speedText = this.formatSpeed((n - task.lastLoaded) / ((now - task.lastTime) / 1000)); task.lastLoaded = n; task.lastTime = now; }
+                    };
+                    updateProgress();
+                    const pending = [];
+                    for (let i = 0; i < totalChunks; i++) if (!uploaded.has(i)) pending.push(i);
+                    const uploadChunk = (index) => new Promise((resolve, reject) => {
+                        const start = index * this.chunkSize;
+                        const blob = file.slice(start, start + this.chunkSize);
+                        const formData = new FormData();
+                        formData.append('upload_id', uploadId); formData.append('index', index); formData.append('chunk', blob);
+                        const xhr = new XMLHttpRequest(); task.chunkXhrs.add(xhr);
+                        xhr.upload.onprogress = (e) => { if (e.lengthComputable) { inFlight.set(index, e.loaded); updateProgress(); } };
+                        xhr.onload = () => { task.chunkXhrs.delete(xhr); inFlight.delete(index); if (xhr.status === 200) { uploaded.add(index); uploadedBytes += chunkSizeAt(index); updateProgress(); resolve(); } else reject(new Error('chunk ' + index + ' HTTP ' + xhr.status)); };
+                        xhr.onerror = () => { task.chunkXhrs.delete(xhr); inFlight.delete(index); reject(new Error('chunk ' + index + ' network error')); };
+                        xhr.onabort = () => { task.chunkXhrs.delete(xhr); inFlight.delete(index); reject(new Error('cancelled')); };
+                        xhr.open('POST', '/api/upload/chunk', true); xhr.send(formData);
+                    });
+                    const uploadWithRetry = async (index) => {
+                        for (let attempt = 1; attempt <= 3; attempt++) {
+                            if (task.cancelled) throw new Error('cancelled');
+                            try { await uploadChunk(index); return; }
+                            catch (e) { if (task.cancelled || attempt === 3) throw e; await this.sleep(800 * attempt); }
+                        }
+                    };
+                    // 4 线程并行取片
+                    const workers = [];
+                    for (let w = 0; w < Math.min(this.uploadThreads, pending.length); w++) {
+                        workers.push((async () => { while (pending.length && !task.cancelled) { const idx = pending.shift(); await uploadWithRetry(idx); } })());
+                    }
+                    await Promise.all(workers);
+                    if (task.cancelled) return 'abort'; // 已取消：分片留在服务端，下次重选同一文件可续传
+                    task.statusText = '合并中...';
+                    const doneRes = await fetch('/api/upload/complete', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ upload_id: uploadId }) });
+                    if (!doneRes.ok) { task.status = 'error'; task.statusText = '合并失败'; return 'abort'; }
+                    const map2 = this.loadResumeMap(); delete map2[key]; this.saveResumeMap(map2);
+                    return true;
+                },
+
+                // 旧的单次上传：仅当分片接口不可用时回退
+                uploadSingleFile(file, task) {
+                    return new Promise((resolve) => {
+                        task.statusText = '上传中...';
                         const formData = new FormData(); formData.append('file', file); formData.append('path', this.path);
                         const xhr = new XMLHttpRequest(); task.xhr = xhr;
                         xhr.upload.onprogress = (e) => {
@@ -742,12 +831,11 @@
                                 const percent = (e.loaded / e.total) * 100; task.progress = percent; task.statusText = percent >= 100 ? '写入中...' : Math.round(percent) + '%'; if (percent >= 100) task.speedText = '';
                             }
                         };
-                        xhr.onload = () => { this.activeCount--; this.processQueue(); if (xhr.status === 200) { task.progress = 100; task.status = 'success'; task.speedText = ''; this.completeTask(task); this.triggerRefresh(); } else { task.status = 'error'; task.statusText = '失败'; } };
-                        xhr.onerror = () => { this.activeCount--; this.processQueue(); task.status = 'error'; task.statusText = '网络错误'; };
-                        xhr.onabort = () => { this.activeCount--; this.processQueue(); task.status = 'error'; task.statusText = '已取消'; };
+                        xhr.onload = () => { if (xhr.status === 200) { task.progress = 100; task.status = 'success'; task.speedText = ''; } else { task.status = 'error'; task.statusText = '失败'; } resolve(); };
+                        xhr.onerror = () => { task.status = 'error'; task.statusText = '网络错误'; resolve(); };
+                        xhr.onabort = () => { task.status = 'error'; task.statusText = '已取消'; resolve(); };
                         xhr.open('POST', '/api/upload', true); xhr.send(formData);
-                    };
-                    this.queue.push(task); this.processQueue();
+                    });
                 },
 
                 async downloadSelected() {
@@ -766,7 +854,7 @@
                                 task.status = 'processing'; task.statusText = '准备下载...'; task.startTime = new Date().getTime();
                                 const dlUrl = `/api/file?path=${encodeURIComponent(file.path)}`;
                                 // 单文件下载不需要清理，传入 null
-                                if (window.showSaveFilePicker) { await this.streamDownload(dlUrl, task.name, task, null); } else { this.fallbackToNative(task, dlUrl, null); }
+                                if (window.showSaveFilePicker) { const r = await this.parallelDownload(dlUrl, task.name, task, null); if (r === 'fallback') await this.streamDownload(dlUrl, task.name, task, null); } else { this.fallbackToNative(task, dlUrl, null); }
                             };
                             this.queue.push(task); this.processQueue();
                             return; 
@@ -786,7 +874,7 @@
                             if (!result) { this.activeCount--; this.processQueue(); return; }
                             
                             // 多文件下载需要清理临时包，传入 result.path
-                            if (window.showSaveFilePicker) { await this.streamDownload(result.url, task.name, task, result.path); } else { this.fallbackToNative(task, result.url, result.path); }
+                            if (window.showSaveFilePicker) { const r = await this.parallelDownload(result.url, task.name, task, result.path); if (r === 'fallback') await this.streamDownload(result.url, task.name, task, result.path); } else { this.fallbackToNative(task, result.url, result.path); }
                         } catch (e) { this.activeCount--; this.processQueue(); task.status = 'error'; task.statusText = '请求失败'; console.error(e); }
                     };
                     this.queue.push(task); this.processQueue();
@@ -849,7 +937,74 @@
                         }
                     }
                 },
-                cancelTask(task) { if (task.status === 'uploading' && task.xhr) task.xhr.abort(); if (task.status === 'downloading' && task.cancelReader) task.cancelReader(); const index = this.transferList.indexOf(task); if (index > -1) this.transferList.splice(index, 1); },
+                cancelTask(task) { task.cancelled = true; if (task.status === 'uploading' && task.xhr) task.xhr.abort(); if (task.chunkXhrs) task.chunkXhrs.forEach(x => { try { x.abort(); } catch(e) {} }); if (task.status === 'downloading' && task.cancelReader) task.cancelReader(); if (task.abortDownload) task.abortDownload(); const index = this.transferList.indexOf(task); if (index > -1) this.transferList.splice(index, 1); },
+
+                // --- 多线程分段下载：先用 Range 0-0 探针确认服务器支持 206，---
+                // --- 再按线程数分段并行拉取，用 writable.seek(offset) 按偏移写盘，---
+                // --- 每段失败重试 3 次。小文件（<8MB）或不支持 Range 时回退单流下载。---
+                // --- 返回 'done'（已处理）、'fallback'（调用方走 streamDownload）。---
+                async parallelDownload(url, filename, task, cleanupPath) {
+                    const PARALLEL_MIN = 8 * 1024 * 1024;
+                    try {
+                        const probe = await fetch(url, { headers: { 'Range': 'bytes=0-0' } });
+                        if (probe.status !== 206) return 'fallback';
+                        const m = (probe.headers.get('Content-Range') || '').match(/\/(\d+)/);
+                        const total = m ? parseInt(m[1], 10) : 0;
+                        await probe.arrayBuffer(); // 探针的 1 字节直接丢弃
+                        if (!total || total < PARALLEL_MIN) return 'fallback';
+                        task.status = 'downloading'; task.statusText = '准备多线程下载...'; task.lastTime = Date.now();
+                        const handle = await window.showSaveFilePicker({ suggestedName: filename });
+                        const writable = await handle.createWritable();
+                        task.abortDownload = () => { try { writable.abort(); } catch(e) {} };
+                        const threads = total > 100 * 1024 * 1024 ? 6 : 4;
+                        const part = Math.ceil(total / threads);
+                        const ranges = [];
+                        for (let i = 0; i < threads; i++) {
+                            const start = i * part, end = Math.min(total - 1, start + part - 1);
+                            if (start <= end) ranges.push({ start, end, done: false });
+                        }
+                        let doneBytes = 0;
+                        const fetchRange = async (rg) => {
+                            for (let attempt = 1; attempt <= 3; attempt++) {
+                                if (task.cancelled) throw new Error('cancelled');
+                                try {
+                                    const res = await fetch(url, { headers: { 'Range': `bytes=${rg.start}-${rg.end}` } });
+                                    if (res.status !== 206) throw new Error('no range');
+                                    const buf = await res.arrayBuffer();
+                                    await writable.seek(rg.start);
+                                    await writable.write(buf);
+                                    rg.done = true; doneBytes += buf.byteLength;
+                                    task.progress = (doneBytes / total) * 100;
+                                    task.statusText = Math.round(task.progress) + '%';
+                                    const now = Date.now();
+                                    if (now - task.lastTime >= 500) { task.speedText = this.formatSpeed((doneBytes - task.lastLoaded) / ((now - task.lastTime) / 1000)); task.lastLoaded = doneBytes; task.lastTime = now; }
+                                    return;
+                                } catch (e) { if (task.cancelled || attempt === 3) throw e; await this.sleep(800 * attempt); }
+                            }
+                        };
+                        let failed = false;
+                        const workers = [];
+                        for (let w = 0; w < ranges.length; w++) {
+                            workers.push((async () => { while (!failed) { const rg = ranges.find(r => !r.done && !r.busy); if (!rg) break; rg.busy = true; try { await fetchRange(rg); } catch (e) { failed = true; throw e; } } })());
+                        }
+                        try { await Promise.all(workers); }
+                        catch (e) { failed = true; try { await writable.abort(); } catch(_) {} throw e; }
+                        await writable.close();
+                        if (cleanupPath) { fetch('/api/delete', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ files: [cleanupPath] }) }); }
+                        this.activeCount--; this.processQueue();
+                        task.progress = 100; task.status = 'success'; task.statusText = '完成'; task.speedText = ''; this.completeTask(task);
+                        return 'done';
+                    } catch (err) {
+                        console.error(err);
+                        if (task.cancelled) { this.activeCount--; this.processQueue(); task.status = 'error'; task.statusText = '已取消'; return 'done'; }
+                        if (err.name === 'NotAllowedError') { this.activeCount--; this.processQueue(); const idx = this.transferList.indexOf(task); if (idx > -1) this.transferList.splice(idx, 1); return 'done'; }
+                        // 探针/取文件句柄阶段失败：还没开始写盘，安全回退单流下载
+                        if (task.status !== 'downloading') return 'fallback';
+                        this.activeCount--; this.processQueue();
+                        task.status = 'error'; task.statusText = '下载失败';
+                        return 'done';
+                    }
+                },
                 completeTask(task) { this.addToHistory(task); setTimeout(() => { const index = this.transferList.indexOf(task); if (index > -1) this.transferList.splice(index, 1); }, 1000); },
                 addToHistory(task) { const record = { name: task.name, type: task.type, time: new Date().toLocaleString(), status: 'success' }; this.transferHistory.unshift(record); this.saveHistory(); },
                 saveHistory() { localStorage.setItem('drive_transfer_history', JSON.stringify(this.transferHistory)); },
