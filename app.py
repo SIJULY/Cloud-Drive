@@ -1333,7 +1333,8 @@ def _dav_auth():
 
 def _dav_unauthorized():
     resp = app.response_class('Unauthorized', status=401)
-    resp.headers['WWW-Authenticate'] = 'Basic realm="我的云盘"'
+    # realm 必须是纯 ASCII：中文写进 HTTP 头会让 gunicorn 发不出响应（线上实测 502）
+    resp.headers['WWW-Authenticate'] = 'Basic realm="Cloud-Drive"'
     return resp
 
 
