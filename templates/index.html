@@ -97,6 +97,7 @@
             font-size: 14px;
             padding: 0 18px;
             display: flex; align-items: center; justify-content: center;
+            white-space: nowrap; flex-shrink: 0;
             transition: all 0.2s; cursor: pointer; user-select: none;
         }
         .btn-pill:hover { color: #2563eb; border-color: #93c5fd; background-color: #eff6ff; }
@@ -162,6 +163,7 @@
         #app .storage-bar { background: linear-gradient(90deg, var(--brand), var(--brand-2)); }
         /* 顶栏 */
         #app .topbar { background: rgba(255,255,255,.92); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); box-shadow: none; }
+        #app .topbar .text-lg { white-space: nowrap; }
         /* 图标按钮：浅灰底 + 深色图标，永远看得见；禁用态半透明但仍有形状 */
         #app .icon-btn { width: 36px; height: 36px; border-radius: 12px; background: #eef0f7; color: #334155; display: inline-flex; align-items: center; justify-content: center; font-size: 15px; transition: all .15s; border: 1px solid transparent; flex-shrink: 0; }
         #app .icon-btn:hover { background: #e2e5f1; color: var(--ink); }
@@ -413,8 +415,8 @@
         </div>
 
         <div class="flex-1 flex flex-col bg-white overflow-hidden relative">
-            <div class="topbar h-16 border-b border-gray-200 flex items-center justify-between px-6 bg-white z-10 shadow-sm">
-                <div class="flex items-center space-x-3">
+            <div class="topbar min-h-16 border-b border-gray-200 flex items-center justify-between flex-wrap gap-x-2 gap-y-2 py-2 px-6 bg-white z-10 shadow-sm">
+                <div class="flex flex-wrap items-center gap-3 min-w-0">
                     <div class="flex items-center space-x-2">
                         <button @click="goUp" :disabled="!path || currentTab !== 'files'" class="icon-btn" title="返回上一级">
                             <i class="fa-solid fa-angle-left"></i>
@@ -424,7 +426,7 @@
                         </button>
                     </div>
 
-                    <div class="flex items-center space-x-3 ml-2">
+                    <div class="flex flex-wrap items-center gap-3 ml-2 min-w-0">
                         <template v-if="currentTab === 'files' && !inMount">
                             <button @click="triggerUpload" class="btn-pill btn-primary">
                                 <i class="fa-solid fa-cloud-arrow-up"></i> 上传
@@ -437,10 +439,10 @@
                             </button>
                             <input type="file" ref="fileInput" @change="handleFileUpload" style="display: none" multiple>
                         </template>
-                        <div v-if="currentTab === 'files' && inMount" class="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-full px-3 py-1.5"><i class="fa-solid fa-lock mr-1"></i> 只读挂载 · 只能看不能改</div>
+                        <div v-if="currentTab === 'files' && inMount" class="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-full px-3 py-1.5 whitespace-nowrap shrink-0"><i class="fa-solid fa-lock mr-1"></i> 只读挂载 · 只能看不能改</div>
 
                         <template v-if="selectedFiles.length > 0 && (currentTab === 'files' || currentTab === 'category' || currentTab === 'favorites')">
-                            <div class="h-6 w-px bg-gray-300 mx-2"></div>
+                            <div class="h-6 w-px bg-gray-300 mx-2 shrink-0"></div>
                             <button @click="shareSelected" class="btn-pill text-purple-600 hover:bg-purple-50 hover:border-purple-200">
                                 <i class="fa-solid fa-share-nodes"></i> 分享
                             </button>
@@ -451,7 +453,7 @@
                                 <i class="fa-solid fa-trash"></i> 删除
                             </button>
                             
-                            <div class="relative" @click.stop>
+                            <div class="relative shrink-0" @click.stop>
                                 <button class="btn-pill" @click="toggleMenu($event)">
                                     更多 <i class="fa-solid fa-caret-down ml-2 text-xs"></i>
                                 </button>
@@ -481,11 +483,11 @@
                     </div>
                 </div>
 
-                <div class="flex items-center space-x-4">
-                    <div class="relative group">
+                <div class="flex flex-wrap items-center gap-4 min-w-0">
+                    <div class="relative group min-w-0">
                         <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-gray-400 text-xs group-focus-within:text-blue-500 transition-colors"></i>
                         <input type="text" v-model="searchQuery" ref="searchInput" placeholder="搜索文件…（回车全文搜索）" @keyup.enter="doFullSearch"
-                               class="search-input pl-9 pr-8 py-2 rounded-full text-sm focus:ring-2 focus:ring-blue-100 outline-none w-48 transition-all focus:w-64 placeholder-gray-400 border border-transparent">
+                               class="search-input pl-9 pr-8 py-2 rounded-full text-sm focus:ring-2 focus:ring-blue-100 outline-none w-48 min-w-0 transition-all focus:w-64 placeholder-gray-400 border border-transparent">
                         <button v-if="searchQuery" @click="searchQuery = ''" class="absolute right-2.5 top-2.5 text-gray-400 hover:text-gray-600">
                             <i class="fa-solid fa-circle-xmark text-sm"></i>
                         </button>
